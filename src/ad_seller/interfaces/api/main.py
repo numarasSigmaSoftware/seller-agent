@@ -21,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from .ui import register_seller_ui
+
 logger = logging.getLogger(__name__)
 
 # Dedicated logger for booking-time forensic events. Per proposal §5.1 Step 2
@@ -99,6 +101,8 @@ app.add_middleware(
     allow_credentials=False,
     expose_headers=["*"],
 )
+
+register_seller_ui(app)
 
 _mcp_server_ref = None
 
@@ -669,6 +673,8 @@ async def root():
     return {
         "name": "Ad Seller System API",
         "version": "0.1.0",
+        "ui": "/ui",
+        "overview": "/overview",
         "docs": "/docs",
     }
 
