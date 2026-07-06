@@ -54,6 +54,8 @@ async def test_seller_ui_assets_are_served(client):
     assert "loadOpenApi" in js_resp.text
     assert "Media Kit" in js_resp.text
     assert "Packages" in js_resp.text
+    assert "Products" in js_resp.text
+    assert 'paths: ["/products", "/api/v1/products"]' in js_resp.text
     assert "Pricing" in js_resp.text
     assert "Deals" in js_resp.text
     assert "Orders" in js_resp.text

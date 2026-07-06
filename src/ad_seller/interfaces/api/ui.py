@@ -573,6 +573,13 @@ const workflows = [
     paths: ["/packages", "/packages/assemble", "/packages/sync"],
   },
   {
+    key: "products",
+    label: "Products",
+    description: "Browse sellable product definitions, inventory metadata, and product-level setup controls.",
+    tags: ["Products"],
+    paths: ["/products", "/api/v1/products"],
+  },
+  {
     key: "pricing",
     label: "Pricing",
     description: "Quote product pricing, inspect rate cards, and update seller rate-card controls.",
