@@ -50,6 +50,33 @@ _UI_HTML = """<!doctype html>
       </article>
     </section>
 
+    <section class="workflow-board" aria-label="Seller workflows">
+      <div class="workflow-head">
+        <div>
+          <p class="eyebrow">Workflow</p>
+          <h2>Seller Operations</h2>
+        </div>
+        <div id="workflow-tabs" class="workflow-tabs" role="tablist" aria-label="Seller workflow areas"></div>
+      </div>
+      <div class="workflow-layout">
+        <section class="workflow-summary" aria-label="Workflow summary">
+          <div>
+            <span class="label">Area</span>
+            <h3 id="workflow-title">-</h3>
+          </div>
+          <p id="workflow-description">-</p>
+          <dl id="workflow-metrics"></dl>
+        </section>
+        <section class="workflow-actions" aria-label="Workflow actions">
+          <div class="panel-head compact">
+            <h3>Actions</h3>
+            <span id="workflow-count">0 routes</span>
+          </div>
+          <div id="workflow-action-list" class="workflow-action-list"></div>
+        </section>
+      </div>
+    </section>
+
     <section class="workspace" aria-label="API Explorer">
       <aside class="endpoint-panel">
         <div class="panel-head">
@@ -154,6 +181,12 @@ h2 {
   font-size: 18px;
 }
 
+h3 {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: 0;
+}
+
 nav {
   display: flex;
   flex-wrap: wrap;
@@ -202,6 +235,7 @@ main {
 }
 
 .overview article,
+.workflow-board,
 .endpoint-panel,
 .request-panel {
   background: var(--surface);
@@ -219,6 +253,128 @@ main {
   display: block;
   overflow-wrap: anywhere;
   font-size: 22px;
+}
+
+.workflow-board {
+  margin-top: 16px;
+}
+
+.workflow-head {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflow-tab,
+.action-button {
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.workflow-tab[aria-selected="true"] {
+  border-color: var(--accent);
+  background: #ccfbf1;
+  color: var(--accent-strong);
+}
+
+.workflow-layout {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 16px;
+  padding: 16px;
+}
+
+.workflow-summary {
+  display: grid;
+  gap: 16px;
+  align-content: start;
+  padding-right: 16px;
+  border-right: 1px solid var(--line);
+}
+
+.workflow-summary p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+dt {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+dd {
+  margin: 2px 0 0;
+  font-weight: 800;
+}
+
+.workflow-actions {
+  min-width: 0;
+}
+
+.compact {
+  padding: 0 0 12px;
+  border-bottom: 0;
+}
+
+#workflow-count {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.workflow-action-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.action-button {
+  display: grid;
+  gap: 4px;
+  min-height: 86px;
+  text-align: left;
+}
+
+.action-button:hover,
+.action-button:focus-visible {
+  border-color: var(--accent);
+  background: #f0fdfa;
+}
+
+.action-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.action-path {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .workspace {
@@ -368,8 +524,21 @@ pre {
   }
 
   .overview,
+  .workflow-head,
+  .workflow-layout,
   .workspace,
   .request-line {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-summary {
+    padding-right: 0;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 16px;
+  }
+
+  .workflow-action-list {
     grid-template-columns: 1fr;
   }
 
@@ -384,9 +553,100 @@ _UI_JS = """
 const state = {
   endpoints: [],
   selectedKey: "",
+  workflowKey: "media-kit",
 };
 
 const methodOrder = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+const workflows = [
+  {
+    key: "media-kit",
+    label: "Media Kit",
+    description: "Publish inventory positioning, public packages, and buyer-facing search entry points.",
+    tags: ["Media Kit"],
+    paths: ["/media-kit", "/media-kit/packages", "/media-kit/search"],
+  },
+  {
+    key: "packages",
+    label: "Packages",
+    description: "Manage package catalog records, assemble custom bundles, and sync inventory-backed offerings.",
+    tags: ["Packages"],
+    paths: ["/packages", "/packages/assemble", "/packages/sync"],
+  },
+  {
+    key: "pricing",
+    label: "Pricing",
+    description: "Quote product pricing, inspect rate cards, and update seller rate-card controls.",
+    tags: ["Pricing", "Quotes"],
+    paths: ["/pricing", "/api/v1/rate-card", "/api/v1/quotes"],
+  },
+  {
+    key: "deals",
+    label: "Deals",
+    description: "Create deals, export or push them to platforms, and inspect buyer or SSP delivery state.",
+    tags: ["Deals", "Deal Booking", "Bulk Operations"],
+    paths: ["/deals", "/api/v1/deals", "/api/v1/deals/export", "/api/v1/deals/push"],
+  },
+  {
+    key: "orders",
+    label: "Orders",
+    description: "Track booked orders through lifecycle transitions, history, reporting, and audit records.",
+    tags: ["Orders", "Change Requests", "Audit"],
+    paths: ["/api/v1/orders", "/api/v1/change-requests"],
+  },
+  {
+    key: "approvals",
+    label: "Approvals",
+    description: "Review pending human approvals, decision actions, and paused workflow resumes.",
+    tags: ["Approvals"],
+    paths: ["/approvals"],
+  },
+  {
+    key: "operations",
+    label: "Operations",
+    description: "Monitor health, events, inventory sync, supply-chain details, and agent registry state.",
+    tags: ["Core", "Events", "Supply Chain", "Agent Registry"],
+    paths: ["/health", "/events", "/api/v1/inventory-sync/status", "/api/v1/supply-chain"],
+  },
+];
+
+const workflowTemplates = {
+  "POST /pricing": {
+    product_id: "premium_video",
+    buyer_tier: "public",
+    agency_id: "",
+    advertiser_id: "",
+    volume: 1000000,
+  },
+  "POST /media-kit/search": {
+    query: "premium video for auto intenders",
+    audience_segments: ["auto_intenders"],
+    max_results: 5,
+  },
+  "POST /packages/assemble": {
+    buyer_id: "buyer-123",
+    objectives: ["awareness"],
+    budget: 25000,
+    constraints: {},
+  },
+  "POST /api/v1/quotes": {
+    buyer_id: "buyer-123",
+    product_id: "premium_video",
+    budget: 50000,
+    flight_start: "2026-08-01",
+    flight_end: "2026-08-31",
+  },
+  "POST /api/v1/orders": {
+    deal_id: "deal-123",
+    buyer_id: "buyer-123",
+    order_name: "August premium video",
+  },
+  "POST /api/v1/change-requests": {
+    order_id: "order-123",
+    requested_by: "seller",
+    change_type: "budget",
+    details: {},
+  },
+};
 
 function $(id) {
   return document.getElementById(id);
@@ -406,6 +666,12 @@ function operationTitle(operation, method, path) {
 }
 
 function requestTemplate(operation) {
+  const method = operation.__method;
+  const path = operation.__path;
+  const template = workflowTemplates[`${method} ${path}`];
+  if (template) {
+    return pretty(template);
+  }
   const schema = operation.requestBody?.content?.["application/json"]?.schema;
   if (!schema || !schema.properties) {
     return "";
@@ -439,6 +705,67 @@ function selectEndpoint(endpoint) {
   $("request-path").value = normalizePath(endpoint.path);
   $("request-body").value = requestTemplate(endpoint.operation);
   renderEndpoints();
+}
+
+function workflowEndpoints(workflow) {
+  return state.endpoints.filter((endpoint) => {
+    const exactPath = workflow.paths.includes(endpoint.path);
+    const familyPath = workflow.paths.some((path) => endpoint.path.startsWith(`${path}/`));
+    const tagged = endpoint.tags.some((tag) => workflow.tags.includes(tag));
+    return exactPath || familyPath || tagged;
+  });
+}
+
+function renderWorkflowTabs() {
+  const tabs = $("workflow-tabs");
+  tabs.innerHTML = "";
+  for (const workflow of workflows) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "workflow-tab";
+    button.id = `workflow-tab-${workflow.key}`;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", workflow.key === state.workflowKey ? "true" : "false");
+    button.textContent = workflow.label;
+    button.addEventListener("click", () => {
+      state.workflowKey = workflow.key;
+      renderWorkflow();
+    });
+    tabs.appendChild(button);
+  }
+}
+
+function renderWorkflow() {
+  renderWorkflowTabs();
+  const workflow = workflows.find((item) => item.key === state.workflowKey) || workflows[0];
+  const endpoints = workflowEndpoints(workflow);
+  $("workflow-title").textContent = workflow.label;
+  $("workflow-description").textContent = workflow.description;
+  $("workflow-count").textContent = `${endpoints.length} routes`;
+  $("workflow-metrics").innerHTML = `
+    <div><dt>Read routes</dt><dd>${endpoints.filter((endpoint) => endpoint.method === "GET").length}</dd></div>
+    <div><dt>Write routes</dt><dd>${endpoints.filter((endpoint) => endpoint.method !== "GET").length}</dd></div>
+    <div><dt>Primary tag</dt><dd>${workflow.tags[0]}</dd></div>
+    <div><dt>Explorer</dt><dd>Connected</dd></div>
+  `;
+
+  const list = $("workflow-action-list");
+  list.innerHTML = "";
+  for (const endpoint of endpoints.slice(0, 8)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "action-button";
+    button.innerHTML = `
+      <span class="method ${endpoint.method.toLowerCase()}">${endpoint.method}</span>
+      <span class="action-title">${endpoint.title}</span>
+      <span class="action-path">${endpoint.path}</span>
+    `;
+    button.addEventListener("click", () => {
+      selectEndpoint(endpoint);
+      $("request-path").focus();
+    });
+    list.appendChild(button);
+  }
 }
 
 function renderEndpoints() {
@@ -500,10 +827,11 @@ async function loadOpenApi() {
         path,
         title: operationTitle(operation, method.toUpperCase(), path),
         tags: operation.tags || [],
-        operation,
+        operation: {...operation, __method: method.toUpperCase(), __path: path},
       }))
   )).sort((a, b) => a.path.localeCompare(b.path) || methodOrder.indexOf(a.method) - methodOrder.indexOf(b.method));
   renderEndpoints();
+  renderWorkflow();
   const firstGet = state.endpoints.find((endpoint) => endpoint.method === "GET" && endpoint.path === "/health")
     || state.endpoints.find((endpoint) => endpoint.method === "GET")
     || state.endpoints[0];

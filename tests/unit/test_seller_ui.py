@@ -19,6 +19,8 @@ async def test_seller_ui_shell_serves_explorer(client):
     assert "text/html" in resp.headers["content-type"]
     assert "Ad Seller System" in resp.text
     assert "API Explorer" in resp.text
+    assert "Seller Operations" in resp.text
+    assert "Seller workflow areas" in resp.text
     assert "/ui/assets/app.css" in resp.text
     assert "/ui/assets/app.js" in resp.text
 
@@ -50,3 +52,11 @@ async def test_seller_ui_assets_are_served(client):
     assert js_resp.status_code == 200
     assert "application/javascript" in js_resp.headers["content-type"]
     assert "loadOpenApi" in js_resp.text
+    assert "Media Kit" in js_resp.text
+    assert "Packages" in js_resp.text
+    assert "Pricing" in js_resp.text
+    assert "Deals" in js_resp.text
+    assert "Orders" in js_resp.text
+    assert "Approvals" in js_resp.text
+    assert "Operations" in js_resp.text
+    assert "workflowTemplates" in js_resp.text
