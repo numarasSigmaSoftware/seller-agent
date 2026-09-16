@@ -1,5 +1,7 @@
 # Console Foundation Implementation Plan
 
+> **Revision pending (2026-09-16):** the spec now places the console in its own repository and container (`seller-console`) instead of inside the agent. This plan still describes the in-repository placement and must be revised before execution; spec section 13 lists what changes. Task 1 (`GET /auth/api-keys/me`) is unaffected and can proceed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A person can enable the console with two environment variables, create an account with one CLI command, log in from a browser, and see the agent's health, their session, inventory sync, and the event bus on a landing page that refreshes itself.
