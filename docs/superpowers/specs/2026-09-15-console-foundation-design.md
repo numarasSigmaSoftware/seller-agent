@@ -19,7 +19,7 @@ The Foundation is the smallest deliverable that lets a person log in from a brow
 | How the console reads data | Through the REST API, in-process, with an operator key on every call | The API stays the only contract. Every gap the console hits is an API gap. Extraction into a separate service later is a base URL change. |
 | Who logs in | Console accounts with username and password, created on the host by CLI | Every publisher can run it on day one. No identity provider required. |
 | What the API sees | One operator key held by the server, labelled `console`, plus an `X-Console-User` header naming the person | Keys never reach the browser. Revoking one key ends all console access. The header puts the person on the wire from the first commit. |
-| Single sign-on | A configured trusted identity header replaces the password check when set | Publishers with SSO put a proxy in front. Nothing in the screens changes. |
+| Single sign-on | A configured trusted identity header, accepted only from configured proxy networks, replaces the password login when set | Publishers with SSO put a proxy in front. In that mode the header is required on every request, cookies are never consulted, and the password endpoints are off. Nothing in the screens changes. |
 | Colors | IAB Tech Lab brand: red `#EE3126`, black `#221F1F`, the site's grey ladder | Sampled from the logo and site. Status colors are semantic, not brand. |
 
 ### Alternatives considered
@@ -96,8 +96,8 @@ The record never holds a key or a password.
 
 The only place that knows about cookies and headers. Returns `Operator(username, role)`.
 
-- If `console_trusted_identity_header` is set and present on the request: look up the account by that value; missing account gives 403 with a plain page. No cookie is involved and the login routes redirect to `/console/`.
-- Otherwise read the cookie, load the session, and return the operator. Missing or expired session: redirect to `/console/login?next=<path>` for page requests; for HTMX requests (header `HX-Request`), respond 401 with `HX-Redirect` set to the login URL.
+- SSO mode (`console_trusted_identity_header` set): the request's client address must be inside `console_trusted_proxy_cidrs`, else 403; the header must be present, else 403; the account it names must exist and be enabled, else 403. Cookies are never consulted in this mode, so a password session cannot substitute for the header, and the login and logout endpoints answer 404. The app refuses to start in SSO mode without the proxy networks.
+- Password mode: read the cookie, load the session, and return the operator. Missing or expired session: redirect to `/console/login?next=<path>` for page requests; for HTMX requests (header `HX-Request`), respond 401 with `HX-Redirect` set to the login URL.
 
 Every console route depends on it except login, logout, and static files.
 
@@ -191,7 +191,8 @@ Settings (environment names in capitals):
 | `console_enabled` | `false` | mount the console |
 | `console_operator_api_key` | none | required when enabled |
 | `console_session_ttl_hours` | `12` | session lifetime |
-| `console_trusted_identity_header` | empty | when set, SSO mode: this header names the user |
+| `console_trusted_identity_header` | empty | when set, SSO mode: this header names the user, required on every request |
+| `console_trusted_proxy_cidrs` | empty | networks the header is trusted from; required in SSO mode |
 
 No signing secret is needed: session tokens are random and the CSRF check is a cookie-to-form comparison.
 
@@ -213,7 +214,7 @@ Small pull requests into `ui/dev` on the fork, each green on its own:
 - **Attribution in the API**: a backend change records `X-Console-User` on audit and order events when the caller is an operator key. Same shape as trusting a proxy header, so one change covers both.
 - **Roles**: the account `role` field gains values and routes check it; the API still sees one key.
 - **Per-user keys**: only if the API itself must enforce roles; added behind `current_operator` without touching screens.
-- **SSO**: set the trusted header and put a proxy in front; the account records become the profile table keyed by the header value.
+- **SSO**: set the trusted header and the proxy networks and put a proxy in front; the account records become the profile table keyed by the header value. A later step replaces the bare header with a signed, audience-bound assertion from the proxy (for example the JWT oauth2-proxy can forward), verified against the identity provider's keys; that needs a JWT library and an identity-provider contract, so it is not in the Foundation.
 - **Extraction**: the console only speaks HTTP to the API, so moving it to its own service is a base URL change plus a session store.
 
 ## 12. Out of scope for the Foundation

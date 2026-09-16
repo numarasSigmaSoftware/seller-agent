@@ -343,6 +343,7 @@ def test_console_defaults(monkeypatch):
         "CONSOLE_OPERATOR_API_KEY",
         "CONSOLE_SESSION_TTL_HOURS",
         "CONSOLE_TRUSTED_IDENTITY_HEADER",
+        "CONSOLE_TRUSTED_PROXY_CIDRS",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = Settings(_env_file=None)
@@ -350,6 +351,7 @@ def test_console_defaults(monkeypatch):
     assert settings.console_operator_api_key is None
     assert settings.console_session_ttl_hours == 12
     assert settings.console_trusted_identity_header == ""
+    assert settings.console_trusted_proxy_cidrs == ""
 
 
 def test_console_settings_read_from_env(monkeypatch):
@@ -357,11 +359,13 @@ def test_console_settings_read_from_env(monkeypatch):
     monkeypatch.setenv("CONSOLE_OPERATOR_API_KEY", "ask_live_abc")
     monkeypatch.setenv("CONSOLE_SESSION_TTL_HOURS", "2")
     monkeypatch.setenv("CONSOLE_TRUSTED_IDENTITY_HEADER", "X-Forwarded-Email")
+    monkeypatch.setenv("CONSOLE_TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 127.0.0.1/32")
     settings = Settings(_env_file=None)
     assert settings.console_enabled is True
     assert settings.console_operator_api_key == "ask_live_abc"
     assert settings.console_session_ttl_hours == 2
     assert settings.console_trusted_identity_header == "X-Forwarded-Email"
+    assert settings.console_trusted_proxy_cidrs == "10.0.0.0/8, 127.0.0.1/32"
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -383,9 +387,14 @@ In `src/ad_seller/config/settings.py`, after the line `api_key_default_expiry_da
     console_enabled: bool = False
     console_operator_api_key: Optional[str] = None
     console_session_ttl_hours: int = 12
-    # When set (e.g. X-Forwarded-Email behind an identity-aware proxy), the
-    # console trusts this header as the username and skips the login form.
+    # SSO mode. When CONSOLE_TRUSTED_IDENTITY_HEADER is set (e.g.
+    # X-Forwarded-Email behind an identity-aware proxy) the console trusts
+    # that header as the username, requires it on every request, and turns
+    # the password login off. The header is only trusted when the request
+    # comes from CONSOLE_TRUSTED_PROXY_CIDRS (comma-separated networks);
+    # SSO mode refuses to start without them.
     console_trusted_identity_header: str = ""
+    console_trusted_proxy_cidrs: str = ""
 ```
 
 - [ ] **Step 4: Make Jinja2 and the multipart parser direct dependencies**
@@ -984,21 +993,55 @@ async def test_valid_cookie_resolves_operator(storage):
     assert response.json() == {"username": "nicolas", "role": "operator"}
 
 
-async def test_trusted_header_replaces_cookie(storage):
+def _sso_app(cidrs):
+    config = ConsoleConfig(
+        operator_api_key="k", trusted_identity_header="X-Forwarded-Email", trusted_proxy_cidrs=cidrs
+    )
+    return _app_with_operator_route(config)
+
+
+async def test_sso_accepts_header_from_trusted_proxy(storage):
     from ad_seller.interfaces.console import accounts
 
     await accounts.create_account("nicolas@example.com", "correct horse battery")
-    config = ConsoleConfig(operator_api_key="k", trusted_identity_header="X-Forwarded-Email")
-    app = _app_with_operator_route(config)
-    ok = await _client(app).get(
-        "/console/whoami", headers={"X-Forwarded-Email": "nicolas@example.com"}
-    )
+    app = _sso_app(["127.0.0.1/32"])  # httpx's ASGI transport reports client 127.0.0.1
+    ok = await _client(app).get("/console/whoami", headers={"X-Forwarded-Email": "nicolas@example.com"})
     assert ok.status_code == 200
     assert ok.json()["username"] == "nicolas@example.com"
-    unknown = await _client(app).get(
-        "/console/whoami", headers={"X-Forwarded-Email": "stranger@example.com"}
-    )
+
+
+async def test_sso_rejects_header_from_untrusted_address(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas@example.com", "correct horse battery")
+    app = _sso_app(["10.0.0.0/8"])
+    spoof = await _client(app).get("/console/whoami", headers={"X-Forwarded-Email": "nicolas@example.com"})
+    assert spoof.status_code == 403
+
+
+async def test_sso_requires_header_and_ignores_cookies(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas@example.com", "correct horse battery")
+    app = _sso_app(["127.0.0.1/32"])
+    token, _ = await auth.create_session("nicolas@example.com", "operator", ttl_hours=1)
+    # a valid password session is not a substitute for the header
+    stale = await _client(app).get("/console/whoami", cookies={auth.SESSION_COOKIE: token})
+    assert stale.status_code == 403
+    missing = await _client(app).get("/console/whoami")
+    assert missing.status_code == 403
+
+
+async def test_sso_rejects_unknown_and_disabled_identities(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("gone@example.com", "correct horse battery")
+    await accounts.set_disabled("gone@example.com", True)
+    app = _sso_app(["127.0.0.1/32"])
+    unknown = await _client(app).get("/console/whoami", headers={"X-Forwarded-Email": "stranger@example.com"})
     assert unknown.status_code == 403
+    disabled = await _client(app).get("/console/whoami", headers={"X-Forwarded-Email": "gone@example.com"})
+    assert disabled.status_code == 403
 
 
 def test_safe_next_only_allows_console_paths():
@@ -1025,7 +1068,7 @@ Create `src/ad_seller/interfaces/console/config.py`:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -1034,18 +1077,25 @@ class ConsoleConfig:
     operator_api_key: Optional[str]
     session_ttl_hours: int = 12
     trusted_identity_header: str = ""
+    trusted_proxy_cidrs: list[str] = field(default_factory=list)
     failure_delay_seconds: float = 0.3
     api_timeout_seconds: float = 2.0
+
+    @property
+    def sso(self) -> bool:
+        return bool(self.trusted_identity_header)
 
     @classmethod
     def from_settings(cls) -> "ConsoleConfig":
         from ad_seller.config.settings import get_settings
 
         settings = get_settings()
+        cidrs = [c.strip() for c in settings.console_trusted_proxy_cidrs.split(",") if c.strip()]
         return cls(
             operator_api_key=settings.console_operator_api_key,
             session_ttl_hours=settings.console_session_ttl_hours,
             trusted_identity_header=settings.console_trusted_identity_header,
+            trusted_proxy_cidrs=cidrs,
         )
 ```
 
@@ -1063,6 +1113,7 @@ logged in. A record never holds a key or a password.
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1196,16 +1247,32 @@ def client_address(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def from_trusted_proxy(request: Request, cidrs: list[str]) -> bool:
+    address = client_address(request)
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip in ipaddress.ip_network(cidr, strict=False) for cidr in cidrs)
+
+
+async def _sso_operator(request: Request, config: ConsoleConfig) -> Operator:
+    """SSO mode: the header is required on every request; cookies are never consulted."""
+    if not from_trusted_proxy(request, config.trusted_proxy_cidrs):
+        raise HTTPException(status_code=403, detail="Console requests must come through the identity proxy")
+    identity = request.headers.get(config.trusted_identity_header)
+    if not identity:
+        raise HTTPException(status_code=403, detail="Identity header missing")
+    account = await get_account(identity)
+    if account is None or account.disabled:
+        raise HTTPException(status_code=403, detail="No console account for this identity")
+    return Operator(username=account.username, role=account.role)
+
+
 async def current_operator(request: Request) -> Operator:
     state: ConsoleState = request.app.state.console
-    header = state.config.trusted_identity_header
-    if header:
-        identity = request.headers.get(header)
-        if identity:
-            account = await get_account(identity)
-            if account is None or account.disabled:
-                raise HTTPException(status_code=403, detail="No console account for this identity")
-            return Operator(username=account.username, role=account.role)
+    if state.config.sso:
+        return await _sso_operator(request, state.config)
 
     token = request.cookies.get(SESSION_COOKIE)
     session = await load_session(token) if token else None
@@ -1228,11 +1295,11 @@ Note on the 303: FastAPI's default `HTTPException` handler returns the status an
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_auth.py -q -p no:warnings
 ```
-Expected: `8 passed`.
+Expected: `11 passed`.
 
 - [ ] **Step 6: Revert check**
 
-In `safe_next`, replace the body with `return value or CONSOLE_ROOT` and rerun: `test_safe_next_only_allows_console_paths` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore.
+In `safe_next`, replace the body with `return value or CONSOLE_ROOT` and rerun: `test_safe_next_only_allows_console_paths` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore.
 
 - [ ] **Step 7: Commit**
 
@@ -1951,16 +2018,24 @@ async def test_login_never_logs_secrets(client, account, caplog):
     assert client.cookies["console_session"] not in text
 
 
-async def test_login_page_redirects_home_in_sso_mode(api_app, console_key, account):
+async def test_password_endpoints_are_404_in_sso_mode(api_app, console_key, account):
     from ad_seller.interfaces.console import mount_console
     from ad_seller.interfaces.console.config import ConsoleConfig
 
     key, _ = console_key
-    mount_console(api_app, ConsoleConfig(operator_api_key=key, trusted_identity_header="X-Forwarded-Email"))
+    mount_console(
+        api_app,
+        ConsoleConfig(
+            operator_api_key=key, trusted_identity_header="X-Forwarded-Email", trusted_proxy_cidrs=["127.0.0.1/32"]
+        ),
+    )
     client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app), base_url="http://test")
-    response = await client.get("/console/login", headers={"X-Forwarded-Email": "nicolas"})
-    assert response.status_code == 303
-    assert response.headers["location"] == "/console/"
+    assert (await client.get("/console/login")).status_code == 404
+    post = await client.post(
+        "/console/login", data={"username": "nicolas", "password": "correct horse battery", "csrf": "x"}
+    )
+    assert post.status_code == 404
+    assert (await client.post("/console/logout", data={"csrf": "x"})).status_code == 404
 ```
 
 - [ ] **Step 3: Run to verify they fail**
@@ -1989,7 +2064,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
@@ -2059,11 +2134,16 @@ def _csrf_ok(request: Request, submitted: str) -> bool:
     return bool(cookie) and hmac.compare_digest(cookie, submitted)
 
 
+def _password_login_enabled(request: Request) -> None:
+    """In SSO mode the password endpoints do not exist: 404, never a redirect."""
+    if _state(request).config.sso:
+        raise HTTPException(status_code=404)
+
+
 @router.get("/login", response_class=HTMLResponse)
 @guarded
 async def login_form(request: Request, next: str | None = None) -> Any:
-    if _state(request).config.trusted_identity_header:
-        return RedirectResponse(auth.CONSOLE_ROOT, status_code=303)
+    _password_login_enabled(request)
     return _login_page(request, error=None, status_code=200, next_path=auth.safe_next(next))
 
 
@@ -2076,6 +2156,7 @@ async def login_submit(
     csrf: str = Form(""),
     next: str = Form(auth.CONSOLE_ROOT),
 ) -> Any:
+    _password_login_enabled(request)
     config = _state(request).config
     next_path = auth.safe_next(next)
     if not _csrf_ok(request, csrf):
@@ -2102,6 +2183,7 @@ async def login_submit(
 @router.post("/logout")
 @guarded
 async def logout(request: Request, csrf: str = Form("")) -> Any:
+    _password_login_enabled(request)
     response = RedirectResponse(auth.LOGIN_PATH, status_code=303)
     if not _csrf_ok(request, csrf):
         return response
@@ -2158,6 +2240,11 @@ def mount_console(root_app: FastAPI, config: Optional[ConsoleConfig] = None) -> 
         raise RuntimeError(
             "CONSOLE_ENABLED=true requires CONSOLE_OPERATOR_API_KEY "
             "(mint one with: ad-seller create-operator-key --label console)"
+        )
+    if config.sso and not config.trusted_proxy_cidrs:
+        raise RuntimeError(
+            "CONSOLE_TRUSTED_IDENTITY_HEADER is set but CONSOLE_TRUSTED_PROXY_CIDRS is empty: "
+            "SSO mode only trusts the header from the proxy's addresses"
         )
     sub = getattr(root_app.state, "console_app", None)
     if sub is None:
@@ -2241,6 +2328,12 @@ from ad_seller.models.api_key import ApiKeyCreateRequest
 async def test_missing_key_refuses_to_mount(api_app):
     with pytest.raises(RuntimeError, match="CONSOLE_OPERATOR_API_KEY"):
         mount_console(api_app, ConsoleConfig(operator_api_key=None))
+
+
+async def test_sso_without_proxy_cidrs_refuses_to_mount(api_app, console_key):
+    key, _ = console_key
+    with pytest.raises(RuntimeError, match="CONSOLE_TRUSTED_PROXY_CIDRS"):
+        mount_console(api_app, ConsoleConfig(operator_api_key=key, trusted_identity_header="X-Forwarded-Email"))
 
 
 async def test_valid_operator_key_passes_startup(console_app):
@@ -2740,9 +2833,10 @@ If an identity-aware proxy (for example oauth2-proxy) sits in front of the agent
 
 ```bash
 CONSOLE_TRUSTED_IDENTITY_HEADER=X-Forwarded-Email
+CONSOLE_TRUSTED_PROXY_CIDRS=10.0.1.0/24
 ```
 
-The console then skips the login form and looks up an account whose username equals the header value, so create accounts with the email as the username. Only set this behind a proxy that strips the header from incoming requests.
+In this mode the header is required on every console request, the password login and logout endpoints are switched off (they answer 404), and cookies are never consulted. The header is trusted only when the request's client address is inside `CONSOLE_TRUSTED_PROXY_CIDRS`; a request from any other address gets 403, and the app refuses to start if the header is configured without the networks. Create accounts with the email as the username. The proxy must strip the header from incoming requests, and the agent must not be reachable except through it.
 
 ## Settings
 
@@ -2752,6 +2846,7 @@ The console then skips the login form and looks up an account whose username equ
 | `CONSOLE_OPERATOR_API_KEY` | none | operator key the console uses for API calls |
 | `CONSOLE_SESSION_TTL_HOURS` | `12` | session lifetime |
 | `CONSOLE_TRUSTED_IDENTITY_HEADER` | empty | when set, SSO mode |
+| `CONSOLE_TRUSTED_PROXY_CIDRS` | empty | networks the identity header is trusted from; required in SSO mode |
 ```
 
 - [ ] **Step 2: Add the guide to the nav and the examples**
@@ -2773,6 +2868,7 @@ In `.env.example`, after the `API_KEY_DEFAULT_EXPIRY_DAYS` comment block, add:
 # CONSOLE_OPERATOR_API_KEY=            # ad-seller create-operator-key --label console
 # CONSOLE_SESSION_TTL_HOURS=12
 # CONSOLE_TRUSTED_IDENTITY_HEADER=     # e.g. X-Forwarded-Email behind an identity-aware proxy
+# CONSOLE_TRUSTED_PROXY_CIDRS=         # networks the header is trusted from, e.g. 10.0.1.0/24
 ```
 
 In `infra/docker/docker-compose.yml`, in the `app` service `environment` block after `REDIS_URL`, add:
