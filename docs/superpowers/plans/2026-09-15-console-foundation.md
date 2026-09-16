@@ -966,13 +966,16 @@ async def test_failure_counters(storage):
 
 
 def _app_with_operator_route(config: ConsoleConfig) -> FastAPI:
-    app = FastAPI()
-    app.state.console = auth.ConsoleState(config=config, api=None)
+    """A sub-application mounted at /console, as the real console is, so root_path is set."""
+    sub = FastAPI()
+    sub.state.console = auth.ConsoleState(config=config, api=None)
 
-    @app.get("/console/whoami")
+    @sub.get("/whoami")
     async def whoami(operator: auth.Operator = Depends(auth.current_operator)):
         return {"username": operator.username, "role": operator.role}
 
+    app = FastAPI()
+    app.mount("/console", sub)
     return app
 
 
@@ -1090,12 +1093,26 @@ async def test_sso_rejects_unknown_and_disabled_identities(storage):
     assert disabled.status_code == 403
 
 
-def test_safe_next_only_allows_console_paths():
-    assert auth.safe_next("/console/deals") == "/console/deals"
-    assert auth.safe_next("/console//evil") == "/console/"
-    assert auth.safe_next("https://evil.example/") == "/console/"
-    assert auth.safe_next(None) == "/console/"
-    assert auth.safe_next("/api/v1/deals") == "/console/"
+def test_safe_next_only_allows_paths_under_the_mount():
+    assert auth.safe_next("/console/deals", "/console") == "/console/deals"
+    assert auth.safe_next("/console//evil", "/console") == "/console/"
+    assert auth.safe_next("https://evil.example/", "/console") == "/console/"
+    assert auth.safe_next(None, "/console") == "/console/"
+    assert auth.safe_next("/api/v1/deals", "/console") == "/console/"
+    assert auth.safe_next("/agent/console/deals", "/agent/console") == "/agent/console/deals"
+
+
+async def test_paths_follow_the_mount_prefix(storage):
+    """Behind a proxy prefix the redirect and cookie path move with the mount."""
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas", "correct horse battery")
+    app = _app_with_operator_route(ConsoleConfig(operator_api_key="k"))
+    outer = FastAPI()
+    outer.mount("/agent", app)
+    response = await _client(outer).get("/agent/console/whoami")
+    assert response.status_code == 303
+    assert response.headers["location"] == "/agent/console/login?next=%2Fagent%2Fconsole%2Fwhoami"
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -1126,6 +1143,7 @@ class ConsoleConfig:
     trusted_proxy_cidrs: list[str] = field(default_factory=list)
     failure_delay_seconds: float = 0.3
     api_timeout_seconds: float = 2.0
+    api_base_url: str = "http://console.local"  # only meaningful with a network transport
 
     @property
     def sso(self) -> bool:
@@ -1177,8 +1195,19 @@ SESSION_PREFIX = "console_session:"
 RATE_PREFIX = "console_ratelimit:"
 RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW_SECONDS = 600
-CONSOLE_ROOT = "/console/"
-LOGIN_PATH = "/console/login"
+
+
+def root(request: Request) -> str:
+    """The mount prefix (``/console`` today, plus any proxy prefix); never hardcode it."""
+    return request.scope.get("root_path", "").rstrip("/")
+
+
+def console_root(request: Request) -> str:
+    return root(request) + "/"
+
+
+def login_path(request: Request) -> str:
+    return root(request) + "/login"
 
 
 @dataclass
@@ -1253,11 +1282,12 @@ async def clear_failures(username: str, address: str) -> None:
         await storage.delete(key)
 
 
-def safe_next(value: Optional[str]) -> str:
-    """Only relative console paths may be redirect targets."""
-    if value and value.startswith(CONSOLE_ROOT) and "//" not in value:
+def safe_next(value: Optional[str], root_path: str) -> str:
+    """Only relative paths under the console mount may be redirect targets."""
+    home = root_path + "/"
+    if value and value.startswith(home) and "//" not in value:
         return value
-    return CONSOLE_ROOT
+    return home
 
 
 def is_htmx(request: Request) -> bool:
@@ -1270,7 +1300,8 @@ def is_secure(request: Request) -> bool:
 
 
 def login_url(request: Request) -> str:
-    return f"{LOGIN_PATH}?next={quote(safe_next(request.url.path), safe='')}"
+    target = safe_next(request.url.path, root(request))
+    return f"{login_path(request)}?next={quote(target, safe='')}"
 
 
 def set_session_cookie(response: Response, request: Request, token: str, max_age: int) -> None:
@@ -1281,12 +1312,12 @@ def set_session_cookie(response: Response, request: Request, token: str, max_age
         httponly=True,
         samesite="lax",
         secure=is_secure(request),
-        path="/console",
+        path=root(request) or "/",
     )
 
 
-def clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE, path="/console")
+def clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(SESSION_COOKIE, path=root(request) or "/")
 
 
 def client_address(request: Request) -> str:
@@ -1352,11 +1383,11 @@ Note on the 303: FastAPI's default `HTTPException` handler returns the status an
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_auth.py -q -p no:warnings
 ```
-Expected: `14 passed`.
+Expected: `15 passed`.
 
 - [ ] **Step 6: Revert check**
 
-In `safe_next`, replace the body with `return value or CONSOLE_ROOT` and rerun: `test_safe_next_only_allows_console_paths` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore. Then in `current_operator`, delete the account reread block: the three `*_kills_an_issued_session` tests must fail. Restore.
+In `safe_next`, replace the body with `return value or home` and rerun: `test_safe_next_only_allows_paths_under_the_mount` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore. Then in `current_operator`, delete the account reread block: the three `*_kills_an_issued_session` tests must fail. Restore.
 
 - [ ] **Step 7: Commit**
 
@@ -1405,17 +1436,22 @@ Move both new imports up to the import block at the top of the file (they are sh
 
 import asyncio
 
+import httpx
 import pytest
-from fastapi import Depends
 
 from ad_seller.auth.api_key_service import ApiKeyService
 from ad_seller.interfaces.api import deps
 from ad_seller.interfaces.console.client import ApiRejected, ApiUnavailable, ConsoleApi
 
 
+def _api(app, key, **kwargs) -> ConsoleApi:
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    return ConsoleApi(transport, "http://console.local", key, **kwargs)
+
+
 async def test_me_returns_console_key_info(api_app, console_key):
     key, key_id = console_key
-    api = ConsoleApi(api_app, key)
+    api = _api(api_app, key)
     me = await api.me(user="nicolas")
     assert me["key_id"] == key_id
     assert me["role"] == "operator"
@@ -1431,7 +1467,7 @@ async def test_every_call_carries_key_and_user_header(api_app, console_key):
         seen["user"] = request.headers.get("x-console-user")
         return await call_next(request)
 
-    api = ConsoleApi(api_app, key)
+    api = _api(api_app, key)
     await api.health(user="nicolas")
     assert seen["authorization"] == f"Bearer {key}"
     assert seen["user"] == "nicolas"
@@ -1439,7 +1475,7 @@ async def test_every_call_carries_key_and_user_header(api_app, console_key):
 
 async def test_health_merges_root_and_health(api_app, console_key):
     key, _ = console_key
-    health = await ConsoleApi(api_app, key).health(user="nicolas")
+    health = await _api(api_app, key).health(user="nicolas")
     assert health["status"] == "healthy"
     assert health["name"] == "Ad Seller System API"
     assert health["version"]
@@ -1447,20 +1483,20 @@ async def test_health_merges_root_and_health(api_app, console_key):
 
 async def test_inventory_sync_status_shape(api_app, console_key):
     key, _ = console_key
-    status = await ConsoleApi(api_app, key).inventory_sync_status(user="nicolas")
+    status = await _api(api_app, key).inventory_sync_status(user="nicolas")
     assert set(status) >= {"enabled", "last_sync", "sync_count"}
 
 
 async def test_last_event_is_none_when_bus_is_empty(api_app, console_key):
     key, _ = console_key
-    assert await ConsoleApi(api_app, key).last_event(user="nicolas") is None
+    assert await _api(api_app, key).last_event(user="nicolas") is None
 
 
 async def test_revoked_key_raises_rejected(api_app, storage, console_key):
     key, key_id = console_key
     await ApiKeyService(storage).revoke_key(key_id)
     with pytest.raises(ApiRejected) as exc:
-        await ConsoleApi(api_app, key).me(user="nicolas")
+        await _api(api_app, key).me(user="nicolas")
     assert exc.value.status == 401
 
 
@@ -1473,7 +1509,7 @@ async def test_server_error_raises_unavailable(api_app, console_key):
     api_app.dependency_overrides[deps._require_api_key_record] = boom
     try:
         with pytest.raises(ApiUnavailable) as exc:
-            await ConsoleApi(api_app, key).me(user="nicolas")
+            await _api(api_app, key).me(user="nicolas")
     finally:
         api_app.dependency_overrides.clear()
     assert exc.value.status == 500
@@ -1489,7 +1525,7 @@ async def test_timeout_raises_unavailable(api_app, console_key):
     api_app.dependency_overrides[deps._require_api_key_record] = slow
     try:
         with pytest.raises(ApiUnavailable) as exc:
-            await ConsoleApi(api_app, key, timeout=0.05).me(user="nicolas")
+            await _api(api_app, key, timeout=0.05).me(user="nicolas")
     finally:
         api_app.dependency_overrides.clear()
     assert exc.value.status == 0
@@ -1545,12 +1581,21 @@ class ApiUnavailable(Exception):
 
 
 class ConsoleApi:
-    def __init__(self, app: Any, operator_api_key: str, timeout: float = 2.0) -> None:
-        self._client = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
-            base_url="http://console.local",
-            follow_redirects=False,
-        )
+    """Talks to the REST API over an injected httpx transport.
+
+    Today the transport is ``httpx.ASGITransport(app=root_app)`` so calls stay
+    in-process; a network deployment passes ``httpx.AsyncHTTPTransport()`` and
+    the API's real base URL instead. Nothing else changes.
+    """
+
+    def __init__(
+        self,
+        transport: httpx.AsyncBaseTransport,
+        base_url: str,
+        operator_api_key: str,
+        timeout: float = 2.0,
+    ) -> None:
+        self._client = httpx.AsyncClient(transport=transport, base_url=base_url, follow_redirects=False)
         self._key = operator_api_key
         self._timeout = timeout
 
@@ -1598,7 +1643,7 @@ class ConsoleApi:
         return max(events, key=lambda e: e.get("timestamp", ""))
 ```
 
-`raise_app_exceptions=False` on the transport turns an unhandled exception inside the API into a 500 response, which `_get` maps to `ApiUnavailable(500, ...)`; without it the exception would propagate into the console route instead.
+The in-process transport is built by `mount_console` as `httpx.ASGITransport(app=root_app, raise_app_exceptions=False)`: the flag turns an unhandled exception inside the API into a 500 response, which `_get` maps to `ApiUnavailable(500, ...)`; without it the exception would propagate into the console route instead.
 
 - [ ] **Step 5: Run to verify they pass**
 
@@ -1657,6 +1702,11 @@ def test_templates_reference_no_external_hosts():
     for path in (CONSOLE / "templates").rglob("*.html"):
         text = path.read_text()
         assert "https://" not in text and "http://" not in text, path
+
+
+def test_templates_never_hardcode_the_mount():
+    for path in (CONSOLE / "templates").rglob("*.html"):
+        assert "/console/" not in path.read_text(), path
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1753,17 +1803,17 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Seller Agent Console{% endblock %}</title>
-  <link rel="stylesheet" href="/console/static/console.css">
-  <script src="/console/static/htmx.min.js" defer></script>
+  <link rel="stylesheet" href="{{ root }}/static/console.css">
+  <script src="{{ root }}/static/htmx.min.js" defer></script>
 </head>
 <body>
 {% block body %}
 <header class="top">
-  <a class="wordmark" href="/console/">iab<i>.</i><span>TECH LAB</span><small>Seller Agent Console</small></a>
+  <a class="wordmark" href="{{ root }}/">iab<i>.</i><span>TECH LAB</span><small>Seller Agent Console</small></a>
   <div class="who" id="who">
     Signed in as <b>{{ operator.username }}</b>
     {% if not sso %}
-    · <form method="post" action="/console/logout">
+    · <form method="post" action="{{ root }}/logout">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <button type="submit">Sign out</button>
       </form>
@@ -1775,7 +1825,7 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
     <div class="lbl">Control room</div>
     {% for item in nav %}
       {% if item.built %}
-        <a href="{{ item.href }}" class="{{ 'active' if item.active else '' }}" id="nav-{{ item.slug }}">{{ item.label }}</a>
+        <a href="{{ root }}{{ item.path }}" class="{{ 'active' if item.active else '' }}" id="nav-{{ item.slug }}">{{ item.label }}</a>
       {% else %}
         <div class="off" id="nav-{{ item.slug }}"><span>{{ item.label }}</span><small>soon</small></div>
       {% endif %}
@@ -1797,8 +1847,8 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
 {% block title %}Sign in · Seller Agent Console{% endblock %}
 {% block body %}
 <div class="login">
-  <form class="login-card" method="post" action="/console/login" id="login-form">
-    <a class="wordmark" href="/console/login">iab<i>.</i><span>TECH LAB</span></a>
+  <form class="login-card" method="post" action="{{ root }}/login" id="login-form">
+    <a class="wordmark" href="{{ root }}/login">iab<i>.</i><span>TECH LAB</span></a>
     <h1>Seller Agent Console</h1>
     <div class="help" style="margin-top:0">Sign in</div>
     <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -1822,7 +1872,7 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
 {% block title %}Setup and health · Seller Agent Console{% endblock %}
 {% block main %}
 <h1>Setup and health</h1>
-<div id="health" hx-get="/console/partials/health" hx-trigger="every 30s" hx-swap="innerHTML">
+<div id="health" hx-get="{{ root }}/partials/health" hx-trigger="every 30s" hx-swap="innerHTML">
   {% include "partials/health_cards.html" %}
 </div>
 <p class="note">Cards refresh every 30 seconds.</p>
@@ -1853,7 +1903,7 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
   <div class="login-card">
     <h1>Something went wrong</h1>
     <p>The console hit an unexpected error. It has been logged with request id <code id="request-id">{{ request_id }}</code>.</p>
-    <p><a href="/console/">Back to the console</a></p>
+    <p><a href="{{ root }}/">Back to the console</a></p>
   </div>
 </div>
 {% endblock %}
@@ -1864,7 +1914,7 @@ h1 { margin: 0 0 16px; font-size: 20px; color: var(--ink); }
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_static_assets.py -q -p no:warnings
 ```
-Expected: `3 passed`.
+Expected: `4 passed`.
 
 - [ ] **Step 7: Commit**
 
@@ -2139,12 +2189,12 @@ router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 NAV = [
-    {"label": "Inbox", "slug": "inbox", "href": "/console/inbox", "built": False},
-    {"label": "Orders", "slug": "orders", "href": "/console/orders", "built": False},
-    {"label": "Deals", "slug": "deals", "href": "/console/deals", "built": False},
-    {"label": "Negotiation", "slug": "negotiation", "href": "/console/negotiation", "built": False},
-    {"label": "Catalog", "slug": "catalog", "href": "/console/catalog", "built": False},
-    {"label": "Setup", "slug": "setup", "href": "/console/", "built": True},
+    {"label": "Inbox", "slug": "inbox", "path": "/inbox", "built": False},
+    {"label": "Orders", "slug": "orders", "path": "/orders", "built": False},
+    {"label": "Deals", "slug": "deals", "path": "/deals", "built": False},
+    {"label": "Negotiation", "slug": "negotiation", "path": "/negotiation", "built": False},
+    {"label": "Catalog", "slug": "catalog", "path": "/catalog", "built": False},
+    {"label": "Setup", "slug": "setup", "path": "/", "built": True},
 ]
 
 GENERIC_LOGIN_ERROR = "Wrong username or password."
@@ -2160,8 +2210,9 @@ def _nav(active_slug: str) -> list[dict[str, Any]]:
 
 
 def _render(request: Request, name: str, status_code: int = 200, **context: Any) -> HTMLResponse:
+    context.setdefault("root", auth.root(request))
     context.setdefault("csrf", request.cookies.get(auth.CSRF_COOKIE, ""))
-    context.setdefault("sso", bool(_state(request).config.trusted_identity_header))
+    context.setdefault("sso", _state(request).config.sso)
     return templates.TemplateResponse(request, name, context, status_code=status_code)
 
 
@@ -2184,7 +2235,7 @@ def _login_page(request: Request, *, error: str | None, status_code: int, next_p
     token = request.cookies.get(auth.CSRF_COOKIE) or secrets.token_urlsafe(32)
     response = _render(request, "login.html", status_code=status_code, csrf=token, error=error, next=next_path)
     response.set_cookie(
-        auth.CSRF_COOKIE, token, httponly=True, samesite="lax", secure=auth.is_secure(request), path="/console"
+        auth.CSRF_COOKIE, token, httponly=True, samesite="lax", secure=auth.is_secure(request), path=auth.root(request) or "/"
     )
     return response
 
@@ -2204,7 +2255,7 @@ def _password_login_enabled(request: Request) -> None:
 @guarded
 async def login_form(request: Request, next: str | None = None) -> Any:
     _password_login_enabled(request)
-    return _login_page(request, error=None, status_code=200, next_path=auth.safe_next(next))
+    return _login_page(request, error=None, status_code=200, next_path=auth.safe_next(next, auth.root(request)))
 
 
 @router.post("/login", response_class=HTMLResponse)
@@ -2214,11 +2265,11 @@ async def login_submit(
     username: str = Form(""),
     password: str = Form(""),
     csrf: str = Form(""),
-    next: str = Form(auth.CONSOLE_ROOT),
+    next: str = Form(""),
 ) -> Any:
     _password_login_enabled(request)
     config = _state(request).config
-    next_path = auth.safe_next(next)
+    next_path = auth.safe_next(next, auth.root(request))
     if not _csrf_ok(request, csrf):
         return _login_page(request, error="The form expired. Try again.", status_code=400, next_path=next_path)
 
@@ -2244,13 +2295,13 @@ async def login_submit(
 @guarded
 async def logout(request: Request, csrf: str = Form("")) -> Any:
     _password_login_enabled(request)
-    response = RedirectResponse(auth.LOGIN_PATH, status_code=303)
+    response = RedirectResponse(auth.login_path(request), status_code=303)
     if not _csrf_ok(request, csrf):
         return response
     token = request.cookies.get(auth.SESSION_COOKIE)
     if token:
         await auth.delete_session(token)
-    auth.clear_session_cookie(response)
+    auth.clear_session_cookie(response, request)
     return response
 ```
 
@@ -2273,6 +2324,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
@@ -2311,9 +2363,10 @@ def mount_console(root_app: FastAPI, config: Optional[ConsoleConfig] = None) -> 
         sub = _build_sub_app()
         root_app.mount("/console", sub, name="console")
         root_app.state.console_app = sub
+    transport = httpx.ASGITransport(app=root_app, raise_app_exceptions=False)
     state = ConsoleState(
         config=config,
-        api=ConsoleApi(root_app, config.operator_api_key, timeout=config.api_timeout_seconds),
+        api=ConsoleApi(transport, config.api_base_url, config.operator_api_key, timeout=config.api_timeout_seconds),
     )
     sub.state.console = state
     return state
@@ -2339,7 +2392,7 @@ async def verify_console_key(root_app: FastAPI) -> None:
     logger.info("console mounted at /console using key %s (%s)", me.get("key_id"), me.get("label"))
 ```
 
-Because `current_operator` reads `request.app.state.console`, and inside a mounted sub-application `request.app` is the sub-application, the state is set on `sub.state`, while `ConsoleApi` targets `root_app` so its calls reach the REST routes.
+Because `current_operator` reads `request.app.state.console`, and inside a mounted sub-application `request.app` is the sub-application, the state is set on `sub.state`, while the ASGI transport targets `root_app` so the client's calls reach the REST routes. `__init__.py` is the only console module that knows the transport is in-process.
 
 - [ ] **Step 6: Run to verify they pass**
 
@@ -2448,47 +2501,69 @@ extracting it into its own service later is a base-URL change, not a rewrite.
 import ast
 from pathlib import Path
 
-PACKAGE = Path(__file__).resolve().parents[3] / "src" / "ad_seller" / "interfaces" / "console"
-FORBIDDEN = (
-    "ad_seller.services",
-    "ad_seller.crews",
-    "ad_seller.agents",
-    "ad_seller.engines",
-    "ad_seller.flows",
-    "ad_seller.tools",
-    "ad_seller.models",
-    "ad_seller.auth",
-    "ad_seller.events",
-    "ad_seller.interfaces.api",
-    "ad_seller.interfaces.mcp_server",
+REPO = Path(__file__).resolve().parents[3]
+PACKAGE = REPO / "src" / "ad_seller" / "interfaces" / "console"
+PACKAGE_NAME = "ad_seller.interfaces.console"
+
+# Everything under ad_seller the console may import, by module prefix. Anything
+# else under ad_seller is forbidden, whether imported absolutely or relatively.
+ALLOWED = (
+    PACKAGE_NAME,
+    "ad_seller.config",
 )
+STORAGE = "ad_seller.storage.factory"  # allowed in accounts.py only
 
 
-def _imports(path: Path):
+def _module_of(path: Path) -> str:
+    rel = path.relative_to(REPO / "src").with_suffix("")
+    parts = list(rel.parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _package_of(path: Path) -> str:
+    module = _module_of(path)
+    return module if path.name == "__init__.py" else module.rsplit(".", 1)[0]
+
+
+def _resolved_imports(path: Path):
+    """Yield absolute module names, resolving relative imports against the file's package."""
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 yield alias.name
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            yield node.module
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                yield node.module or ""
+                continue
+            base = _package_of(path).split(".")
+            base = base[: len(base) - (node.level - 1)]
+            yield ".".join(base + ([node.module] if node.module else []))
 
 
-def test_console_never_imports_agent_internals():
+def test_console_imports_only_allowlisted_ad_seller_modules():
     offenders = []
     for path in PACKAGE.rglob("*.py"):
-        for name in _imports(path):
-            if name.startswith(FORBIDDEN):
-                offenders.append(f"{path}: {name}")
+        for name in _resolved_imports(path):
+            if not name.startswith("ad_seller"):
+                continue
+            allowed = ALLOWED + ((STORAGE,) if path.name == "accounts.py" else ())
+            if not name.startswith(allowed):
+                offenders.append(f"{path.relative_to(REPO)}: {name}")
     assert offenders == []
 
 
-def test_only_accounts_touches_storage():
-    for path in PACKAGE.rglob("*.py"):
-        if path.name == "accounts.py":
-            continue
-        for name in _imports(path):
-            assert not name.startswith("ad_seller.storage"), f"{path} imports {name}"
+def test_relative_imports_are_resolved_by_the_guard(tmp_path):
+    """A `from ...services import x` inside the package must be caught, not skipped."""
+    fake = PACKAGE / "_guard_probe.py"
+    fake.write_text("from ...services import deal_service\n")
+    try:
+        names = list(_resolved_imports(fake))
+    finally:
+        fake.unlink()
+    assert names == ["ad_seller.services"]
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -2585,6 +2660,7 @@ async def test_home_renders_shell_and_cards(client, account, console_key):
     assert els["card-agent"]["attrs"]["data-state"] == "ok"
     assert "Healthy" in els["card-agent"]["text"]
     assert "Ad Seller System API" in els["card-agent"]["text"]
+    assert 'href="/console/static/console.css"' in page.text  # derived from root_path, not typed
     assert els["card-access"]["attrs"]["data-state"] == "ok"
     assert "nicolas" in els["card-access"]["text"]
     assert key_id in els["card-access"]["text"]
@@ -2593,7 +2669,7 @@ async def test_home_renders_shell_and_cards(client, account, console_key):
     assert "Disabled" in els["card-sync"]["text"]
     assert els["card-events"]["attrs"]["data-state"] == "ok"
     # the event bus is a process-wide singleton, so earlier tests may have published
-    assert "No events yet" in els["card-events"]["text"] or "last event" in els["card-events"]["text"]
+    assert "No events yet" in els["card-events"]["text"] or "Last event" in els["card-events"]["text"]
     assert 'hx-get="/console/partials/health"' in page.text
     assert 'hx-trigger="every 30s"' in page.text
 
@@ -2739,16 +2815,12 @@ def _sync_card(result: Any) -> dict[str, str]:
 
 
 def _events_card(result: Any) -> dict[str, str]:
+    """Only what the API says: the console does not read the agent's settings."""
     if isinstance(result, Exception):
         return _degraded("events", "Event bus", result)
-    from ad_seller.config.settings import get_settings
-
-    enabled = get_settings().event_bus_enabled
     if result is None:
-        detail = "No events yet"
-    else:
-        detail = f"last event {result.get('event_type')} at {result.get('timestamp')}"
-    return _card("events", "Event bus", "ok", "ok" if enabled else "warn", "Enabled" if enabled else "Disabled", detail)
+        return _card("events", "Event bus", "ok", "warn", "No events yet", "the bus has published nothing this process can see")
+    return _card("events", "Event bus", "ok", "ok", "Last event", f"{result.get('event_type')} at {result.get('timestamp')}")
 
 
 async def build_cards(state: ConsoleState, operator: Operator) -> tuple[list[dict[str, str]], str]:
@@ -2972,7 +3044,7 @@ This closes pull request 4: title `docs: operator console guide`.
 ## Self-review against the spec
 
 - Spec §3 package layout: Tasks 4, 6, 7, 8, 9 create every listed file; `config.py` is an addition to the spec's list (the spec put config inside `auth.py`; a separate file keeps `auth.py` from importing settings).
-- Spec §3 import rule: Task 10 `test_import_rule.py`, with the storage seam confined to `accounts.py` (`auth.py` reaches storage only through `accounts.kv`).
+- Spec §3 import rule: Task 10 `test_import_rule.py`, allowlist-based and resolving relative imports, with the storage seam confined to `accounts.py` (`auth.py` reaches storage only through `accounts.kv`).
 - Spec §3 `me` route: Tasks 1 and 2.
 - Spec §4 accounts, login, sessions, `current_operator`, console key: Tasks 4, 5, 6, 9, 10. Rate limit, generic message, fixed delay, CSRF, cookie flags, rotation, logout: Task 9 tests.
 - Spec §5 pages and palette: Task 8 templates and CSS, Task 11 cards.

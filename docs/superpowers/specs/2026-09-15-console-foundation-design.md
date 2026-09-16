@@ -16,7 +16,7 @@ The Foundation is the smallest deliverable that lets a person log in from a brow
 |---|---|---|
 | Frontend stack | Server-rendered Jinja2 pages with HTMX partials, inside FastAPI | The agent is Python only. One language, one test runner, one container. No Node in CI or Docker. |
 | Where the console lives | A package `src/ad_seller/interfaces/console/`, mounted at `/console` behind a flag | Sibling of the existing `api`, `chat`, and `cli` interfaces. Optional by default. |
-| How the console reads data | Through the REST API, in-process, with an operator key on every call | The API stays the only contract. Every gap the console hits is an API gap. Extraction into a separate service later is a base URL change. |
+| How the console reads data | Through the REST API over an injected HTTP transport, in-process today, with an operator key on every call | The API stays the only contract. Every gap the console hits is an API gap. Extraction into a separate service later swaps the transport and the base URL; paths and cookies already follow the mount prefix. |
 | Who logs in | Console accounts with username and password, created on the host by CLI | Every publisher can run it on day one. No identity provider required. |
 | What the API sees | One operator key held by the server, labelled `console`, plus an `X-Console-User` header naming the person | Keys never reach the browser. Revoking one key ends all console access. The header is display context for logs, chosen by the caller and not verified by the API; it is not attribution. |
 | Single sign-on | A configured trusted identity header, accepted only from configured proxy networks, replaces the password login when set | Publishers with SSO put a proxy in front. In that mode the header is required on every request, cookies are never consulted, and the password endpoints are off. Nothing in the screens changes. |
@@ -56,7 +56,9 @@ The CLI gains `ad-seller create-console-user`, next to the existing `create-oper
 
 ### Import rule
 
-The console package imports from: its own modules, FastAPI and Starlette, Jinja2, httpx, `ad_seller.config`, and one adapter in `auth.py` that wraps the generic key-value storage interface (`get`, `set`, `delete`, TTL). It never imports `ad_seller.services`, `crews`, `agents`, `engines`, `flows`, `tools`, or `models`. Wire shapes come from API JSON. A unit test enforces this by walking the package's import statements. The rule is what keeps the extraction path open by construction.
+The console package imports from: its own modules, FastAPI and Starlette, Jinja2, httpx, `ad_seller.config`, and one seam in `accounts.py` that wraps the generic key-value storage interface (`get`, `set`, `delete`, `keys`, TTL). Every other `ad_seller` module is forbidden: `services`, `crews`, `agents`, `engines`, `flows`, `tools`, `models`, `auth`, `events`, and the API package. Wire shapes come from API JSON validated into console-owned models. A unit test enforces this as an allowlist, resolving relative imports to absolute names so `from ...services import x` is caught. The rule is what keeps the extraction path open by construction.
+
+Paths are never hardcoded: templates, redirects, and cookie paths derive from the mount's `root_path`, so the console works under `/console` and under a proxy prefix such as `/agent/console` without change.
 
 ### New API route
 
@@ -127,7 +129,7 @@ Title "Setup and health", Setup active in the sidebar. Four cards:
 | Agent | `GET /health`, `GET /` | health status, API name and version, time of check |
 | Console access | `GET /auth/api-keys/me` | username, session time left, console key label, id, active or revoked, expiry |
 | Inventory sync | `GET /api/v1/inventory-sync/status` | enabled or disabled, last run, watermark when present |
-| Event bus | `GET /events?limit=1` | enabled state from settings, last event type and age |
+| Event bus | `GET /events` | last event type and time, or "no events yet"; only what the API returns, never local settings |
 
 The cards live in a partial, `GET /console/partials/health`, which HTMX polls every 30 seconds (`hx-trigger="every 30s"`). The page has no JavaScript of its own.
 
@@ -150,7 +152,7 @@ The wordmark is rendered as text. Whether the console ships the IAB logo image i
 
 ## 6. API client and data flow
 
-`client.py` defines `ConsoleApi`, built once in `mount_console` with the app and the console key. It uses `httpx.AsyncClient` with `ASGITransport(app=app)`, so a call goes through the real REST router in-process: same dependencies, same handlers, same JSON, no socket. Every request carries `Authorization: Bearer <console key>` and `X-Console-User: <username>`.
+`client.py` defines `ConsoleApi`, built once in `mount_console` with an httpx transport, a base URL, and the console key. Today the transport is `ASGITransport(app=app)`, so a call goes through the real REST router in-process: same dependencies, same handlers, same JSON, no socket. A network deployment passes an HTTP transport and the API's URL; only `mount_console` knows which. Every request carries `Authorization: Bearer <console key>` and `X-Console-User: <username>`.
 
 Foundation methods: `me()`, `health()` (health plus root, for the version), `inventory_sync_status()`, `last_event()`. Each returns the parsed JSON body as a dict, or raises `ApiUnavailable(status, detail)` for 5xx, timeouts, and non-JSON bodies, and `ApiRejected(status)` for 401 and 403. Nothing outside `client.py` imports httpx.
 
@@ -220,7 +222,7 @@ Small pull requests into `ui/dev` on the fork, each green on its own:
 - **Roles**: the account `role` field gains values and routes check it; a role change bumps `credentials_changed_at`, so open sessions pick it up at once. The API still sees one key.
 - **Per-user keys**: only if the API itself must enforce roles; added behind `current_operator` without touching screens.
 - **SSO**: set the trusted header and the proxy networks and put a proxy in front; the account records become the profile table keyed by the header value. A later step replaces the bare header with a signed, audience-bound assertion from the proxy (for example the JWT oauth2-proxy can forward), verified against the identity provider's keys; that needs a JWT library and an identity-provider contract, so it is not in the Foundation.
-- **Extraction**: the console only speaks HTTP to the API, so moving it to its own service is a base URL change plus a session store.
+- **Extraction**: the console only speaks HTTP to the API through an injected transport, its paths follow the mount, and it reads no agent settings for page content, so moving it to its own service is a transport and base URL change plus a session store.
 
 ## 12. Out of scope for the Foundation
 
