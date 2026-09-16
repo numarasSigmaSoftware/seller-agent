@@ -18,7 +18,7 @@ The Foundation is the smallest deliverable that lets a person log in from a brow
 | Where the console lives | A package `src/ad_seller/interfaces/console/`, mounted at `/console` behind a flag | Sibling of the existing `api`, `chat`, and `cli` interfaces. Optional by default. |
 | How the console reads data | Through the REST API, in-process, with an operator key on every call | The API stays the only contract. Every gap the console hits is an API gap. Extraction into a separate service later is a base URL change. |
 | Who logs in | Console accounts with username and password, created on the host by CLI | Every publisher can run it on day one. No identity provider required. |
-| What the API sees | One operator key held by the server, labelled `console`, plus an `X-Console-User` header naming the person | Keys never reach the browser. Revoking one key ends all console access. The header puts the person on the wire from the first commit. |
+| What the API sees | One operator key held by the server, labelled `console`, plus an `X-Console-User` header naming the person | Keys never reach the browser. Revoking one key ends all console access. The header is display context for logs, chosen by the caller and not verified by the API; it is not attribution. |
 | Single sign-on | A configured trusted identity header, accepted only from configured proxy networks, replaces the password login when set | Publishers with SSO put a proxy in front. In that mode the header is required on every request, cookies are never consulted, and the password endpoints are off. Nothing in the screens changes. |
 | Colors | IAB Tech Lab brand: red `#EE3126`, black `#221F1F`, the site's grey ladder | Sampled from the logo and site. Status colors are semantic, not brand. |
 
@@ -216,7 +216,7 @@ Small pull requests into `ui/dev` on the fork, each green on its own:
 
 ## 11. Growth path
 
-- **Attribution in the API**: a backend change records `X-Console-User` on audit and order events when the caller is an operator key. Same shape as trusting a proxy header, so one change covers both.
+- **Attribution in the API**: `X-Console-User` is context, not attribution, because whoever holds any operator key can set it. Before the console performs mutations, before audit records name a person, and before roles are enforced, the API must receive something it can verify: either a per-user delegated credential, or an actor assertion signed with a secret bound to the console key and checked by the API. The API, not the console's routes, enforces authorization at that point. Recording the bare header on audit events is acceptable only as a "claimed by" field next to the key id that actually authenticated.
 - **Roles**: the account `role` field gains values and routes check it; a role change bumps `credentials_changed_at`, so open sessions pick it up at once. The API still sees one key.
 - **Per-user keys**: only if the API itself must enforce roles; added behind `current_operator` without touching screens.
 - **SSO**: set the trusted header and the proxy networks and put a proxy in front; the account records become the profile table keyed by the header value. A later step replaces the bare header with a signed, audience-bound assertion from the proxy (for example the JWT oauth2-proxy can forward), verified against the identity provider's keys; that needs a JWT library and an identity-provider contract, so it is not in the Foundation.

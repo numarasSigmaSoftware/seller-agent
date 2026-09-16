@@ -1512,6 +1512,9 @@ Create `src/ad_seller/interfaces/console/client.py`:
 
 Every call goes through the real REST routers via httpx's ASGI transport, so
 the API's own auth and handlers run. Nothing outside this module imports httpx.
+The ``X-Console-User`` header is display context for the API's logs: the API
+authenticates the console key only and does not verify the header, so it must
+never be treated as attribution (see the spec's growth path).
 The ASGI transport runs the app inline, so the per-call bound is enforced with
 ``asyncio.wait_for`` rather than a socket timeout.
 """
