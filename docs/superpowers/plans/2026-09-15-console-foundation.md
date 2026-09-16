@@ -489,12 +489,24 @@ import pytest
 from ad_seller.interfaces.console import accounts
 
 
-def test_hash_is_scrypt_and_verifies():
-    salt = b"\x01" * 16
-    digest = accounts.hash_password("correct horse battery", salt)
-    assert len(digest) == 64  # 32 bytes hex
-    assert accounts.verify_password("correct horse battery", salt.hex(), digest)
-    assert not accounts.verify_password("wrong horse battery", salt.hex(), digest)
+def test_hash_is_self_describing_scrypt_at_owasp_parameters():
+    stored = accounts.hash_password("correct horse battery")
+    algo, log_n, r, p, salt_hex, hash_hex = stored.split("$")
+    assert (algo, log_n, r, p) == ("scrypt", "17", "8", "1")
+    assert len(bytes.fromhex(salt_hex)) == 16
+    assert len(bytes.fromhex(hash_hex)) == 32
+    assert accounts.verify_password("correct horse battery", stored) == (True, False)
+    assert accounts.verify_password("wrong horse battery", stored) == (False, False)
+
+
+def test_weaker_parameters_verify_but_ask_for_rehash():
+    legacy = accounts.hash_password("correct horse battery", log_n=14)
+    assert legacy.startswith("scrypt$14$8$1$")
+    assert accounts.verify_password("correct horse battery", legacy) == (True, True)
+
+
+def test_garbage_hash_never_verifies():
+    assert accounts.verify_password("anything at all", "not$a$hash") == (False, False)
 
 
 async def test_create_and_get_account(storage):
@@ -505,9 +517,10 @@ async def test_create_and_get_account(storage):
     stored = await storage.get("console_user:nicolas")
     assert "correct horse battery" not in str(stored)
     assert set(stored) == {
-        "username", "password_hash", "salt", "role", "disabled",
+        "username", "password_hash", "role", "disabled",
         "created_at", "last_login_at", "credentials_changed_at",
     }
+    assert stored["password_hash"].startswith("scrypt$17$8$1$")
     assert account.credentials_changed_at == stored["credentials_changed_at"]
     assert (await accounts.get_account("nicolas")).username == "nicolas"
     assert await accounts.get_account("nobody") is None
@@ -527,6 +540,18 @@ async def test_duplicate_username_rejected(storage):
     await accounts.create_account("nicolas", "correct horse battery")
     with pytest.raises(ValueError, match="exists"):
         await accounts.create_account("nicolas", "another long password")
+
+
+async def test_login_rehashes_a_weaker_stored_hash(storage):
+    created = await accounts.create_account("nicolas", "correct horse battery")
+    record = await storage.get("console_user:nicolas")
+    record["password_hash"] = accounts.hash_password("correct horse battery", log_n=14)
+    await storage.set("console_user:nicolas", record)
+    assert await accounts.check_credentials("nicolas", "correct horse battery") is not None
+    upgraded = await storage.get("console_user:nicolas")
+    assert upgraded["password_hash"].startswith("scrypt$17$8$1$")
+    # a rehash is not a credential change: open sessions survive it
+    assert upgraded["credentials_changed_at"] == created.credentials_changed_at
 
 
 async def test_check_credentials(storage):
@@ -596,7 +621,12 @@ from typing import Any, Optional
 ACCOUNT_PREFIX = "console_user:"
 MIN_PASSWORD_LENGTH = 12
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
-_SCRYPT = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
+# OWASP password storage minimum for scrypt: N=2^17, r=8, p=1 (128 MiB, ~0.3 s).
+# The stored string carries its own parameters, so raising these later only
+# requires a rehash on the next successful login, never a migration.
+_LOG_N, _R, _P = 17, 8, 1
+_DKLEN = 32
+_MAXMEM = 256 * 2**20  # hashlib's default 32 MiB cap is below what N=2^17 needs
 
 
 @dataclass
@@ -617,28 +647,42 @@ async def kv():
     return await get_storage()
 
 
-def hash_password(password: str, salt: bytes) -> str:
-    return hashlib.scrypt(password.encode("utf-8"), salt=salt, **_SCRYPT).hex()
+def _scrypt(password: str, salt: bytes, log_n: int, r: int, p: int) -> str:
+    return hashlib.scrypt(
+        password.encode("utf-8"), salt=salt, n=2**log_n, r=r, p=p, dklen=_DKLEN, maxmem=_MAXMEM
+    ).hex()
 
 
-def verify_password(password: str, salt_hex: str, expected_hex: str) -> bool:
-    candidate = hash_password(password, bytes.fromhex(salt_hex))
-    return hmac.compare_digest(candidate, expected_hex)
+def hash_password(password: str, *, log_n: int = _LOG_N, r: int = _R, p: int = _P) -> str:
+    """Self-describing hash: ``scrypt$<log2 N>$<r>$<p>$<salt hex>$<hash hex>``."""
+    salt = secrets.token_bytes(16)
+    return "$".join(["scrypt", str(log_n), str(r), str(p), salt.hex(), _scrypt(password, salt, log_n, r, p)])
+
+
+def verify_password(password: str, stored: str) -> tuple[bool, bool]:
+    """Return (matches, needs_rehash). Unparseable input never matches."""
+    try:
+        algo, log_n, r, p, salt_hex, hash_hex = stored.split("$")
+        if algo != "scrypt":
+            return False, False
+        log_n, r, p = int(log_n), int(r), int(p)
+        candidate = _scrypt(password, bytes.fromhex(salt_hex), log_n, r, p)
+    except (ValueError, TypeError):
+        return False, False
+    matches = hmac.compare_digest(candidate, hash_hex)
+    weaker = (log_n, r, p) < (_LOG_N, _R, _P)
+    return matches, matches and weaker
 
 
 @lru_cache(maxsize=1)
 def _dummy_record() -> dict[str, Any]:
     """A record to hash against when the username does not exist.
 
-    Keeps the failure path the same shape (one scrypt call) whether or not
-    the account exists, so timing does not reveal valid usernames.
+    Keeps the failure path the same shape (one scrypt call at the current
+    parameters) whether or not the account exists, so timing does not reveal
+    valid usernames.
     """
-    salt = b"\x00" * 16
-    return {
-        "salt": salt.hex(),
-        "password_hash": hash_password("no such account", salt),
-        "disabled": True,
-    }
+    return {"password_hash": hash_password("no such account"), "disabled": True}
 
 
 def _now() -> str:
@@ -670,11 +714,9 @@ async def create_account(username: str, password: str) -> Account:
     storage = await kv()
     if await storage.get(ACCOUNT_PREFIX + username) is not None:
         raise ValueError(f"account {username!r} already exists")
-    salt = secrets.token_bytes(16)
     record = {
         "username": username,
-        "password_hash": hash_password(password, salt),
-        "salt": salt.hex(),
+        "password_hash": hash_password(password),
         "role": "operator",
         "disabled": False,
         "created_at": _now(),
@@ -695,9 +737,13 @@ async def check_credentials(username: str, password: str) -> Optional[Account]:
     storage = await kv()
     record = await storage.get(ACCOUNT_PREFIX + username) if username else None
     candidate = record if record is not None else _dummy_record()
-    ok = verify_password(password, candidate["salt"], candidate["password_hash"])
+    ok, needs_rehash = verify_password(password, candidate["password_hash"])
     if record is None or not ok or record["disabled"]:
         return None
+    if needs_rehash:
+        # Stronger parameters than the record was hashed with: upgrade in place.
+        # Not a credential change, so credentials_changed_at is left alone.
+        record["password_hash"] = hash_password(password)
     record["last_login_at"] = _now()
     await storage.set(ACCOUNT_PREFIX + username, record)
     return _to_account(record)
@@ -720,9 +766,7 @@ async def reset_password(username: str, password: str) -> bool:
     record = await storage.get(ACCOUNT_PREFIX + username)
     if record is None:
         return False
-    salt = secrets.token_bytes(16)
-    record["salt"] = salt.hex()
-    record["password_hash"] = hash_password(password, salt)
+    record["password_hash"] = hash_password(password)
     record["credentials_changed_at"] = _now()
     await storage.set(ACCOUNT_PREFIX + username, record)
     return True
@@ -733,11 +777,11 @@ async def reset_password(username: str, password: str) -> bool:
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_accounts.py -q -p no:warnings
 ```
-Expected: `8 passed`.
+Expected: `11 passed` in about 15 seconds: every scrypt call at N=2^17 costs roughly a third of a second, which is the point.
 
 - [ ] **Step 6: Revert check**
 
-Change `hmac.compare_digest(candidate, expected_hex)` to `True` and rerun: `test_hash_is_scrypt_and_verifies` and `test_check_credentials` must fail. Restore.
+Change `hmac.compare_digest(candidate, expected)` to `True` and rerun: `test_hash_is_self_describing_scrypt_at_owasp_parameters` and `test_check_credentials` must fail. Restore. Then change `_LOG_N` to `14`: `test_hash_is_self_describing_scrypt_at_owasp_parameters` and `test_login_rehashes_a_weaker_stored_hash` must fail. Restore.
 
 - [ ] **Step 7: Commit**
 

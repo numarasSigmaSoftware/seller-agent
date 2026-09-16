@@ -71,14 +71,14 @@ Paths are never hardcoded: templates, redirects, and cookie paths derive from th
 Record `console_user:<username>` in the key-value store:
 
 ```
-{ "username": str, "password_hash": str, "salt": str, "role": "operator",
+{ "username": str, "password_hash": "scrypt$17$8$1$<salt hex>$<hash hex>", "role": "operator",
   "disabled": bool, "created_at": iso8601, "last_login_at": iso8601 | null,
   "credentials_changed_at": iso8601 }
 ```
 
 `credentials_changed_at` is bumped by every disable, password reset, and later role change. It is what revokes sessions (below).
 
-Passwords are hashed with `hashlib.scrypt` (standard library; n=2**14, r=8, p=1, 16-byte random salt) and compared with `hmac.compare_digest`. Minimum length twelve characters, enforced by the CLI. Passwords are never logged. `role` is fixed to `operator` in the Foundation and exists so later roles need no migration.
+Passwords are hashed with `hashlib.scrypt` from the standard library at the OWASP minimum, N=2^17, r=8, p=1, with a 16-byte random salt, and compared with `hmac.compare_digest`. The stored string is self-describing (`scrypt$17$8$1$salt$hash`), so when the parameters are raised later, an account hashed with weaker ones is verified and rehashed in place on its next successful login, with no migration and without invalidating its sessions. Minimum length twelve characters, enforced by the CLI. Passwords are never logged. `role` is fixed to `operator` in the Foundation and exists so later roles need no migration.
 
 Accounts are created, reset, and disabled only through the CLI on the host. There are no account management routes.
 
