@@ -179,14 +179,18 @@ Page request flow:
 
 ## 8. Testing
 
-All tests are pytest under `tests/unit/console/`, using the FastAPI TestClient against the real app with the console flag on. No browser automation.
+All tests are pytest under `tests/unit/console/`, using the FastAPI TestClient against the real app with the console flag on.
+
+Browser automation is intentionally deferred from the Foundation. Server-side tests verify the HTMX attributes, the partial response, asset serving, and the HX-Redirect behaviour. Before the landing-page PR merges, a manual smoke test must confirm login, the 30-second DOM refresh, the session-expiry redirect, and logout. Browser automation is added before the first mutating or multi-step HTMX workflow.
 
 - **Real storage.** SQLite backend on a temporary path. Accounts are created through the CLI function.
 - **Real API.** The in-process client hits the real routes. The console key is minted in the test through the API key service.
 - **Failures forced at the boundary.** Revoked key by revoking it through the API. Timeouts and 5xx by overriding one route's dependency to sleep or raise.
 - **HTML assertions** through a small helper on the standard library HTML parser, finding elements by id and data attributes only.
 - **Security tests**: cookie flags; token rotation on login; logout deletes the record; CSRF token required; rate limit trips on the sixth failure and clears after the TTL; no secret substring in logs captured on login and error paths.
-- **Structural tests**: the import rule; the OpenAPI drift test extended by the `me` route.
+- **Structural tests**: the import rule; the OpenAPI drift test extended by the `me` route; every POST route carries the CSRF dependency.
+- **Wiring tests**: the flag-gated mount function runs on a fresh app with patched settings, and the app's real lifespan is entered with the console mounted, once with a valid key and once with a revoked one.
+- **Beyond unit tests, before each PR merges**: the existing integration suite; a container build that must refuse a bad key and serve the login page with a good one; and CI running on the PR itself, which needs the fork's workflow trigger widened to `ui/dev`.
 - **Revert checks.** Each implementation task names the test that goes red when its change is reverted.
 - **Not covered in the Foundation.** The console tests run on SQLite. Running the session and rate-limit tests against the Redis and Postgres backends of the hybrid store needs those services in the test run and is a follow-up alongside the existing integration suite.
 
@@ -212,6 +216,7 @@ Documentation: a new guide `docs/guides/console.md` (enable, mint the console ke
 
 Small pull requests into `ui/dev` on the fork, each green on its own:
 
+0. Fork-only CI trigger so pull requests targeting `ui/dev` run the full workflow. Never sent upstream.
 1. `GET /auth/api-keys/me` with test and docs. Also opened upstream.
 2. Console package: flag, client, accounts, CLI command, login, logout, empty shell.
 3. Landing page cards and the polling partial.

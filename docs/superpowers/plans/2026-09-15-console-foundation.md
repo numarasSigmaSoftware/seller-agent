@@ -72,9 +72,52 @@ Modified files:
 | `docs/api/overview.md`, `docs/index.md`, `README.md` | endpoint count 88 to 89, `me` row |
 | `mkdocs.yml` | nav entry for the guide |
 | `.env.example`, `infra/docker/docker-compose.yml` | commented console variables |
+| `.github/workflows/ci.yml` | fork only: CI for pull requests targeting `ui/dev` |
 | `CHANGELOG.md` | Unreleased entries |
 
-Delivery: tasks 1 to 2 are pull request 1 (`me` route, also upstream). Tasks 3 to 10 are pull request 2 (console package). Tasks 11 to 12 are pull request 3 (landing page). Task 13 is pull request 4 (docs and examples). Each PR targets `ui/dev` on the fork.
+Delivery: task 0 is pull request 0 (CI trigger, fork only). Tasks 1 to 2 are pull request 1 (`me` route, also upstream). Tasks 3 to 10 are pull request 2 (console package). Tasks 11 to 12 are pull request 3 (landing page). Task 13 is pull request 4 (docs and examples). Each PR targets `ui/dev` on the fork and gets the full CI run there.
+
+---
+
+## Task 0: Run CI for pull requests targeting `ui/dev` (fork only)
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`, `.github/workflows/hygiene.yml`
+
+Both workflows trigger on `pull_request` only for `main`, so every PR into `ui/dev` would merge with no CI. This change is for the fork only: it must never be included in a PR to the upstream repository, so it lands as its own PR into `ui/dev` before Task 1 and is dropped when a branch is later opened upstream.
+
+- [ ] **Step 1: Widen the triggers**
+
+In `.github/workflows/ci.yml`, change
+
+```yaml
+  pull_request:
+    branches: [main]
+```
+
+to
+
+```yaml
+  pull_request:
+    branches: [main, ui/dev]
+```
+
+`hygiene.yml` already triggers on every `pull_request` (no branch filter), so only its `push` trigger differs; leave it as it is.
+
+- [ ] **Step 2: Verify**
+
+```bash
+grep -n "branches" .github/workflows/ci.yml .github/workflows/hygiene.yml
+```
+Expected: `ci.yml` shows `branches: [main, ui/dev]` under `pull_request`.
+
+- [ ] **Step 3: Commit and open PR 0**
+
+```bash
+git add .github/workflows/ci.yml
+git -c user.name="numaras" -c user.email="nicolas.umaras@sigma.software" commit -m "ci: run CI for pull requests targeting ui/dev (fork only)"
+```
+Open it against `ui/dev` and confirm the CI workflow appears on the PR itself; merge before starting Task 1.
 
 ---
 
@@ -2665,7 +2708,8 @@ async def test_buyer_key_fails_startup(api_app, storage):
         ApiKeyCreateRequest(agency_id="agy-1", agency_name="Acme", label="acme")
     )
     mount_console(api_app, ConsoleConfig(operator_api_key=buyer.api_key))
-    with pytest.raises(RuntimeError, match="rejected"):
+    # a buyer key is valid, so /me answers 200 with role=buyer: the check must read the role
+    with pytest.raises(RuntimeError, match="not an operator key"):
         await verify_console_key(api_app)
 
 
@@ -2686,7 +2730,53 @@ def test_shared_app_has_no_console_by_default():
     from ad_seller.interfaces.api.main import app
 
     assert not any(getattr(r, "path", "") == "/console" for r in app.routes)
+
+
+def _has_console_mount(app: FastAPI) -> bool:
+    return any(getattr(r, "path", "") == "/console" for r in app.routes)
+
+
+def test_flag_off_mounts_nothing(api_app, monkeypatch):
+    from ad_seller.interfaces.api import main
+
+    monkeypatch.setattr(main.get_settings(), "console_enabled", False)
+    assert main._mount_console_if_enabled(api_app) is False
+    assert not _has_console_mount(api_app)
+
+
+def test_flag_on_mounts_from_settings(api_app, console_key, monkeypatch):
+    """The production wiring: settings on, key in settings, mount happens."""
+    from ad_seller.interfaces.api import main
+
+    key, _ = console_key
+    settings = main.get_settings()
+    monkeypatch.setattr(settings, "console_enabled", True)
+    monkeypatch.setattr(settings, "console_operator_api_key", key)
+    monkeypatch.setattr(settings, "console_trusted_identity_header", "")
+    assert main._mount_console_if_enabled(api_app) is True
+    assert _has_console_mount(api_app)
+    assert api_app.state.console_app.state.console.config.operator_api_key == key
+
+
+async def test_lifespan_refuses_a_revoked_console_key(console_app, storage, console_key):
+    """The real lifespan, on an app with the console mounted: a bad key stops startup."""
+    from ad_seller.interfaces.api import main
+
+    _, key_id = console_key
+    await ApiKeyService(storage).revoke_key(key_id)
+    with pytest.raises(RuntimeError, match="rejected"):
+        async with main.lifespan(console_app):
+            pass
+
+
+async def test_lifespan_starts_and_stops_with_a_valid_console_key(console_app):
+    from ad_seller.interfaces.api import main
+
+    async with main.lifespan(console_app):
+        assert console_app.state.console_app.state.console is not None
 ```
+
+The two lifespan tests run `main.lifespan` itself, so they also start and stop the inventory scheduler (a no-op unless enabled) and attempt the MCP mount, which `lifespan` already tolerates failing.
 
 ```python
 # tests/unit/console/test_import_rule.py
@@ -2771,7 +2861,7 @@ def test_relative_imports_are_resolved_by_the_guard(tmp_path):
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_startup.py tests/unit/console/test_import_rule.py -q -p no:warnings
 ```
-Expected: the import-rule tests pass already (the package is clean); `test_startup.py` passes except nothing yet fails. If everything passes, that is fine: `test_shared_app_has_no_console_by_default` and the wiring below are what Step 3 adds, and the revert check in Step 5 proves the tests bite.
+Expected: the import-rule tests pass already (the package is clean). In `test_startup.py`, `test_flag_off_mounts_nothing` and `test_flag_on_mounts_from_settings` fail with `AttributeError: module ... has no attribute '_mount_console_if_enabled'`, and both lifespan tests fail because `lifespan` does not yet call `verify_console_key`. The rest pass.
 
 - [ ] **Step 3: Wire the flag and the startup check into the API app**
 
@@ -2798,10 +2888,22 @@ At the very end of `main.py`, after the `_mark_routes_changed` block, add:
 
 from ...config.settings import get_settings  # noqa: E402
 
-if get_settings().console_enabled:
-    from ..console import mount_console  # noqa: E402
 
-    mount_console(app)
+def _mount_console_if_enabled(application) -> bool:
+    """Mount the console when CONSOLE_ENABLED is set. Returns whether it mounted.
+
+    A function rather than a bare ``if`` so the wiring itself is testable on a
+    fresh app with patched settings (tests/unit/console/test_startup.py).
+    """
+    if not get_settings().console_enabled:
+        return False
+    from ..console import mount_console
+
+    mount_console(application)
+    return True
+
+
+_mount_console_if_enabled(app)
 ```
 
 - [ ] **Step 4: Run the console tests and the drift tests**
@@ -2814,7 +2916,7 @@ Expected: all pass. The OpenAPI document does not change because the console is 
 
 - [ ] **Step 5: Revert check**
 
-In `verify_console_key`, replace the body with `return`: `test_revoked_key_fails_startup` and `test_buyer_key_fails_startup` must fail. Restore. In `mount_console`, remove the `if not config.operator_api_key` guard: `test_missing_key_refuses_to_mount` must fail. Restore.
+In `verify_console_key`, replace the body with `return`: `test_revoked_key_fails_startup`, `test_buyer_key_fails_startup`, and `test_lifespan_refuses_a_revoked_console_key` must fail. Restore. In `mount_console`, remove the `if not config.operator_api_key` guard: `test_missing_key_refuses_to_mount` must fail. Restore. In `_mount_console_if_enabled`, replace the flag read with `False`: `test_flag_on_mounts_from_settings` must fail. Restore.
 
 - [ ] **Step 6: Commit**
 
@@ -3094,9 +3196,11 @@ git -c user.name="numaras" -c user.email="nicolas.umaras@sigma.software" commit 
 
 ---
 
-## Task 12: Full-suite run and manual smoke test
+## Task 12: Full-suite run, integration suite, container check, and the manual browser smoke test
 
-**Files:** none changed unless the suite finds something.
+**Files:** none changed unless the runs find something.
+
+Browser automation is intentionally deferred from the Foundation. Server-side tests verify the HTMX attributes, the partial response, asset serving, and the HX-Redirect behaviour. Before PR 3 merges, the manual smoke test below must confirm login, the 30-second DOM refresh, the session-expiry redirect, and logout. Browser automation is added before the first mutating or multi-step HTMX workflow, not before.
 
 - [ ] **Step 1: Full unit suite**
 
@@ -3105,26 +3209,70 @@ rm -f ad_seller.db data/audit_fallback.jsonl
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit -q -p no:warnings --timeout=600
 rm -f ad_seller.db data/audit_fallback.jsonl
 ```
-Expected: all passed; the count is the previous total plus about 55 console tests. Any failure is fixed before moving on, never deselected.
+Expected: all passed; the count is the previous total plus about 80 console tests. Any failure is fixed before moving on, never deselected.
 
-- [ ] **Step 2: Manual smoke test**
+- [ ] **Step 2: Integration suite**
+
+```bash
+rm -f ad_seller.db data/audit_fallback.jsonl
+PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/integration -q -p no:warnings --timeout=900
+rm -f ad_seller.db data/audit_fallback.jsonl
+```
+Expected: passed or skipped only. Tests that need live services (the AAMP registry smoke test, MCP over the network) skip when those are absent; a failure is a blocker, a skip is not. Record the pass, fail, and skip counts in the PR body.
+
+- [ ] **Step 3: Container check**
+
+The image must build with the console inside it, refuse to start with a bad key, and serve the login page with a good one. Storage is SQLite on a named volume so the key minted before startup is the key the server reads.
+
+```bash
+docker build -f infra/docker/Dockerfile -t seller-console-smoke .
+docker volume create console-smoke
+ENV="-e STORAGE_TYPE=sqlite -e DATABASE_URL=sqlite:////data/smoke.db -v console-smoke:/data"
+
+# 1. a bad key must stop the container with the rejected-key message
+docker run --rm $ENV -e CONSOLE_ENABLED=true -e CONSOLE_OPERATOR_API_KEY=ask_live_bogus seller-console-smoke; echo "exit=$?"
+
+# 2. mint the console key and an account inside the image, against the volume
+KEY=$(docker run --rm $ENV seller-console-smoke ad-seller create-operator-key --label console --quiet)
+printf 'correct horse battery\ncorrect horse battery\n' | docker run --rm -i $ENV seller-console-smoke ad-seller create-console-user --username nicolas
+
+# 3. start with the good key and fetch the login page
+docker run -d --name console-smoke -p 8000:8000 $ENV -e CONSOLE_ENABLED=true -e CONSOLE_OPERATOR_API_KEY="$KEY" seller-console-smoke
+sleep 5
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/console/login
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/console/static/htmx.min.js
+docker logs console-smoke 2>&1 | grep -c "console mounted at /console"
+docker rm -f console-smoke && docker volume rm console-smoke
+```
+Expected: step 1 prints the `CONSOLE_OPERATOR_API_KEY was rejected by the API (status 401)` message and a non-zero exit; step 3 prints `200`, `200`, and `1`.
+
+- [ ] **Step 4: Manual browser smoke test (required before PR 3 merges)**
 
 ```bash
 export STORAGE_TYPE=sqlite DATABASE_URL="sqlite:///$(pwd)/smoke.db"
 KEY=$(PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync ad-seller create-operator-key --label console --quiet)
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync ad-seller create-console-user --username nicolas
-CONSOLE_ENABLED=true CONSOLE_OPERATOR_API_KEY="$KEY" PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync uvicorn ad_seller.interfaces.api.main:app --port 8000
+CONSOLE_ENABLED=true CONSOLE_OPERATOR_API_KEY="$KEY" CONSOLE_SESSION_TTL_HOURS=1 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync uvicorn ad_seller.interfaces.api.main:app --port 8000
 ```
-In a browser: `http://localhost:8000/console/` redirects to the login page; a wrong password shows the generic message; the right one lands on Setup and health with four cards; wait 30 seconds and confirm the "checked" time advances; sign out returns to login. Then stop the server and:
+In a browser, confirm each of these and tick them in the PR body:
 
-```bash
-CONSOLE_ENABLED=true CONSOLE_OPERATOR_API_KEY=ask_live_bogus PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync uvicorn ad_seller.interfaces.api.main:app --port 8000
-```
-Expected: startup fails with `CONSOLE_OPERATOR_API_KEY was rejected by the API (status 401)`.
+1. `http://localhost:8000/console/` redirects to the login page; a wrong password shows the generic message; the right one lands on Setup and health with four cards.
+2. Wait 30 seconds without reloading: the "checked" time in the Agent card advances (the DOM refresh through HTMX).
+3. Session expiry: in a second terminal delete the session record, then click any link or wait for the next poll:
+   ```bash
+   PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync python -c "
+   import asyncio
+   from ad_seller.storage.factory import get_storage
+   async def main():
+       s = await get_storage()
+       for k in await s.keys('session:console:*'):
+           await s.delete(k)
+   asyncio.run(main())"
+   ```
+   The next poll must send the browser to the login page (HX-Redirect), not leave a stale page.
+4. Sign out returns to the login page, and the back button does not show the landing page without a new login.
 
-```bash
-rm -f smoke.db
-```
+Then stop the server and `rm -f smoke.db`.
 
 This closes pull request 3: title `feat: console landing page (Setup and health)`.
 
@@ -3273,5 +3421,6 @@ This closes pull request 4: title `docs: operator console guide`.
 - Spec §7 error handling: Task 7 (client errors), Task 9 (redirects, 429, sub-app exception handler), Task 10 (startup refusal before the scheduler starts), Task 11 (degraded cards, error page, logs without secrets).
 - Spec §8 testing: real SQLite, real API, boundary-forced failures, HTML by id, security tests, structural tests, revert checks: every task.
 - Spec §9 configuration, deployment, documentation: Tasks 3, 13.
-- Spec §10 delivery: PR boundaries marked after Tasks 2, 10, 12, 13.
+- Spec §10 delivery: PR boundaries marked after Tasks 0, 2, 10, 12, 13.
+- Spec §8 validation beyond unit tests: Task 10 tests the real flag wiring and lifespan; Task 12 runs the integration suite, the container check, and the manual browser smoke test; Task 0 makes CI run on the PRs themselves. Browser automation is deferred by decision, stated in Task 12.
 - Not in this plan, by spec §12: real screens, roles, per-user keys, proxy container, attribution backend change, logo image, dark theme.
