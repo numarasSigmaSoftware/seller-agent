@@ -505,8 +505,10 @@ async def test_create_and_get_account(storage):
     stored = await storage.get("console_user:nicolas")
     assert "correct horse battery" not in str(stored)
     assert set(stored) == {
-        "username", "password_hash", "salt", "role", "disabled", "created_at", "last_login_at"
+        "username", "password_hash", "salt", "role", "disabled",
+        "created_at", "last_login_at", "credentials_changed_at",
     }
+    assert account.credentials_changed_at == stored["credentials_changed_at"]
     assert (await accounts.get_account("nicolas")).username == "nicolas"
     assert await accounts.get_account("nobody") is None
 
@@ -537,15 +539,18 @@ async def test_check_credentials(storage):
 
 
 async def test_disabled_account_cannot_log_in(storage):
-    await accounts.create_account("nicolas", "correct horse battery")
+    created = await accounts.create_account("nicolas", "correct horse battery")
     assert await accounts.set_disabled("nicolas", True) is True
+    bumped = await accounts.get_account("nicolas")
+    assert bumped.credentials_changed_at > created.credentials_changed_at
     assert await accounts.check_credentials("nicolas", "correct horse battery") is None
     assert await accounts.set_disabled("nobody", True) is False
 
 
 async def test_reset_password(storage):
-    await accounts.create_account("nicolas", "correct horse battery")
+    created = await accounts.create_account("nicolas", "correct horse battery")
     assert await accounts.reset_password("nicolas", "new horse battery staple") is True
+    assert (await accounts.get_account("nicolas")).credentials_changed_at > created.credentials_changed_at
     assert await accounts.check_credentials("nicolas", "correct horse battery") is None
     assert await accounts.check_credentials("nicolas", "new horse battery staple") is not None
     assert await accounts.reset_password("nobody", "new horse battery staple") is False
@@ -601,6 +606,8 @@ class Account:
     disabled: bool
     created_at: str
     last_login_at: Optional[str]
+    credentials_changed_at: str
+    """Bumped on every disable, password reset, or role change; sessions issued before it are dead."""
 
 
 async def kv():
@@ -645,6 +652,7 @@ def _to_account(record: dict[str, Any]) -> Account:
         disabled=bool(record["disabled"]),
         created_at=record["created_at"],
         last_login_at=record.get("last_login_at"),
+        credentials_changed_at=record["credentials_changed_at"],
     )
 
 
@@ -671,6 +679,7 @@ async def create_account(username: str, password: str) -> Account:
         "disabled": False,
         "created_at": _now(),
         "last_login_at": None,
+        "credentials_changed_at": _now(),
     }
     await storage.set(ACCOUNT_PREFIX + username, record)
     return _to_account(record)
@@ -700,6 +709,7 @@ async def set_disabled(username: str, disabled: bool) -> bool:
     if record is None:
         return False
     record["disabled"] = disabled
+    record["credentials_changed_at"] = _now()
     await storage.set(ACCOUNT_PREFIX + username, record)
     return True
 
@@ -713,6 +723,7 @@ async def reset_password(username: str, password: str) -> bool:
     salt = secrets.token_bytes(16)
     record["salt"] = salt.hex()
     record["password_hash"] = hash_password(password, salt)
+    record["credentials_changed_at"] = _now()
     await storage.set(ACCOUNT_PREFIX + username, record)
     return True
 ```
@@ -984,6 +995,9 @@ async def test_no_cookie_tells_htmx_to_redirect(storage):
 
 
 async def test_valid_cookie_resolves_operator(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas", "correct horse battery")
     app = _app_with_operator_route(ConsoleConfig(operator_api_key="k"))
     token, _ = await auth.create_session("nicolas", "operator", ttl_hours=1)
     response = await _client(app).get(
@@ -991,6 +1005,38 @@ async def test_valid_cookie_resolves_operator(storage):
     )
     assert response.status_code == 200
     assert response.json() == {"username": "nicolas", "role": "operator"}
+
+
+async def test_disabling_the_account_kills_an_issued_session(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas", "correct horse battery")
+    app = _app_with_operator_route(ConsoleConfig(operator_api_key="k"))
+    token, _ = await auth.create_session("nicolas", "operator", ttl_hours=1)
+    client = _client(app)
+    assert (await client.get("/console/whoami", cookies={auth.SESSION_COOKIE: token})).status_code == 200
+    await accounts.set_disabled("nicolas", True)
+    dead = await client.get("/console/whoami", cookies={auth.SESSION_COOKIE: token})
+    assert dead.status_code == 303
+    assert await auth.load_session(token) is None
+
+
+async def test_password_reset_kills_an_issued_session(storage):
+    from ad_seller.interfaces.console import accounts
+
+    await accounts.create_account("nicolas", "correct horse battery")
+    app = _app_with_operator_route(ConsoleConfig(operator_api_key="k"))
+    token, _ = await auth.create_session("nicolas", "operator", ttl_hours=1)
+    await accounts.reset_password("nicolas", "new horse battery staple")
+    dead = await _client(app).get("/console/whoami", cookies={auth.SESSION_COOKIE: token})
+    assert dead.status_code == 303
+
+
+async def test_deleted_account_kills_an_issued_session(storage):
+    app = _app_with_operator_route(ConsoleConfig(operator_api_key="k"))
+    token, _ = await auth.create_session("ghost", "operator", ttl_hours=1)
+    dead = await _client(app).get("/console/whoami", cookies={auth.SESSION_COOKIE: token})
+    assert dead.status_code == 303
 
 
 def _sso_app(cidrs):
@@ -1276,14 +1322,25 @@ async def current_operator(request: Request) -> Operator:
 
     token = request.cookies.get(SESSION_COOKIE)
     session = await load_session(token) if token else None
+    account = await get_account(session["username"]) if session else None
+    if session is not None and (
+        account is None
+        or account.disabled
+        or datetime.fromisoformat(session["created_at"])
+        < datetime.fromisoformat(account.credentials_changed_at)
+    ):
+        # The account changed under the session (disabled, password reset, role change):
+        # the session is dead, whatever its TTL says.
+        await delete_session(token)
+        session = None
     if session is None:
         url = login_url(request)
         if is_htmx(request):
             raise HTTPException(status_code=401, headers={"HX-Redirect": url})
         raise HTTPException(status_code=303, headers={"Location": url})
     return Operator(
-        username=session["username"],
-        role=session["role"],
+        username=account.username,
+        role=account.role,
         session_expires_at=datetime.fromisoformat(session["expires_at"]),
     )
 ```
@@ -1295,11 +1352,11 @@ Note on the 303: FastAPI's default `HTTPException` handler returns the status an
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_auth.py -q -p no:warnings
 ```
-Expected: `11 passed`.
+Expected: `14 passed`.
 
 - [ ] **Step 6: Revert check**
 
-In `safe_next`, replace the body with `return value or CONSOLE_ROOT` and rerun: `test_safe_next_only_allows_console_paths` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore.
+In `safe_next`, replace the body with `return value or CONSOLE_ROOT` and rerun: `test_safe_next_only_allows_console_paths` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore. Then in `current_operator`, delete the account reread block: the three `*_kills_an_issued_session` tests must fail. Restore.
 
 - [ ] **Step 7: Commit**
 

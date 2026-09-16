@@ -70,8 +70,11 @@ Record `console_user:<username>` in the key-value store:
 
 ```
 { "username": str, "password_hash": str, "salt": str, "role": "operator",
-  "disabled": bool, "created_at": iso8601, "last_login_at": iso8601 | null }
+  "disabled": bool, "created_at": iso8601, "last_login_at": iso8601 | null,
+  "credentials_changed_at": iso8601 }
 ```
+
+`credentials_changed_at` is bumped by every disable, password reset, and later role change. It is what revokes sessions (below).
 
 Passwords are hashed with `hashlib.scrypt` (standard library; n=2**14, r=8, p=1, 16-byte random salt) and compared with `hmac.compare_digest`. Minimum length twelve characters, enforced by the CLI. Passwords are never logged. `role` is fixed to `operator` in the Foundation and exists so later roles need no migration.
 
@@ -92,12 +95,14 @@ Record `console_session:<token>` with `{ "username", "role", "created_at" }`, wr
 
 The record never holds a key or a password.
 
+A session is only a pointer to an account, not a snapshot of it. On every request `current_operator` rereads the account: a missing or disabled account, or a session created before the account's `credentials_changed_at`, kills the session on the spot. Disabling an account or resetting its password therefore ends its sessions immediately, not at the TTL. The same mechanism carries future role changes.
+
 ### current_operator
 
 The only place that knows about cookies and headers. Returns `Operator(username, role)`.
 
 - SSO mode (`console_trusted_identity_header` set): the request's client address must be inside `console_trusted_proxy_cidrs`, else 403; the header must be present, else 403; the account it names must exist and be enabled, else 403. Cookies are never consulted in this mode, so a password session cannot substitute for the header, and the login and logout endpoints answer 404. The app refuses to start in SSO mode without the proxy networks.
-- Password mode: read the cookie, load the session, and return the operator. Missing or expired session: redirect to `/console/login?next=<path>` for page requests; for HTMX requests (header `HX-Request`), respond 401 with `HX-Redirect` set to the login URL.
+- Password mode: read the cookie, load the session, reread the account, and return the operator with the account's current role. Missing or expired session, or a session invalidated by an account change: redirect to `/console/login?next=<path>` for page requests; for HTMX requests (header `HX-Request`), respond 401 with `HX-Redirect` set to the login URL.
 
 Every console route depends on it except login, logout, and static files.
 
@@ -212,7 +217,7 @@ Small pull requests into `ui/dev` on the fork, each green on its own:
 ## 11. Growth path
 
 - **Attribution in the API**: a backend change records `X-Console-User` on audit and order events when the caller is an operator key. Same shape as trusting a proxy header, so one change covers both.
-- **Roles**: the account `role` field gains values and routes check it; the API still sees one key.
+- **Roles**: the account `role` field gains values and routes check it; a role change bumps `credentials_changed_at`, so open sessions pick it up at once. The API still sees one key.
 - **Per-user keys**: only if the API itself must enforce roles; added behind `current_operator` without touching screens.
 - **SSO**: set the trusted header and the proxy networks and put a proxy in front; the account records become the profile table keyed by the header value. A later step replaces the bare header with a signed, audience-bound assertion from the proxy (for example the JWT oauth2-proxy can forward), verified against the identity provider's keys; that needs a JWT library and an identity-provider contract, so it is not in the Foundation.
 - **Extraction**: the console only speaks HTTP to the API, so moving it to its own service is a base URL change plus a session store.
