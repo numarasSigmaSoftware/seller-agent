@@ -86,14 +86,14 @@ Accounts are created, reset, and disabled only through the CLI on the host. Ther
 
 `GET /console/login` renders the form and sets a pre-login cookie with a random CSRF value. `POST /console/login` requires the form field to equal the cookie value, then:
 
-1. Rate limit check: at most five failures per username and per client address in ten minutes, tracked in the store with a ten-minute TTL. Exceeded gives 429 and a message with the wait time.
+1. Rate limit check: at most five failures per username and per client address in ten minutes. Each failure is its own key with a ten-minute TTL under the `rate_limit:` prefix, and the count is the number of live keys, so concurrent failures are never lost to a read-modify-write and expiry belongs to the store. Exceeded gives 429 and a message with the wait time.
 2. Account lookup and hash comparison, always taking the same code path so timing does not reveal whether the username exists.
 3. Failure: one generic message for wrong username, wrong password, and disabled account, after a fixed 300 ms delay.
 4. Success: create a session, set the cookie, redirect to the requested path or `/console/`.
 
 ### Sessions
 
-Record `console_session:<token>` with `{ "username", "role", "created_at" }`, written with the store's TTL set to `console_session_ttl_hours` (default 12). The token is `secrets.token_urlsafe(32)`. The cookie `console_session` holds only the token and is HTTP-only, SameSite Lax, path `/console`, and Secure when the request scheme is https. A new token is issued on every login. Logout deletes the record and clears the cookie.
+Record `session:console:<token>` with `{ "username", "role", "created_at", "expires_at" }`, written with the store's TTL set to `console_session_ttl_hours` (default 12). The `session:` and `rate_limit:` prefixes are the ones the hybrid backend already routes to Redis, so on that backend console sessions and failure counters land in the ephemeral store without a change to the router. The token is `secrets.token_urlsafe(32)`. The cookie `console_session` holds only the token and is HTTP-only, SameSite Lax, path `/console`, and Secure when the request scheme is https. A new token is issued on every login. Logout deletes the record and clears the cookie.
 
 The record never holds a key or a password.
 
@@ -188,6 +188,7 @@ All tests are pytest under `tests/unit/console/`, using the FastAPI TestClient a
 - **Security tests**: cookie flags; token rotation on login; logout deletes the record; CSRF token required; rate limit trips on the sixth failure and clears after the TTL; no secret substring in logs captured on login and error paths.
 - **Structural tests**: the import rule; the OpenAPI drift test extended by the `me` route.
 - **Revert checks.** Each implementation task names the test that goes red when its change is reverted.
+- **Not covered in the Foundation.** The console tests run on SQLite. Running the session and rate-limit tests against the Redis and Postgres backends of the hybrid store needs those services in the test run and is a follow-up alongside the existing integration suite.
 
 ## 9. Configuration, deployment, documentation
 

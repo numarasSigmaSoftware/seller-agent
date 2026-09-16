@@ -1009,6 +1009,24 @@ async def test_failure_counters(storage):
     assert await auth.failures("nicolas", "10.0.0.1") == 0
 
 
+async def test_concurrent_failures_are_all_counted(storage):
+    """No read-modify-write: ten failures recorded at once are ten, not fewer."""
+    import asyncio
+
+    await asyncio.gather(*(auth.record_failure("nicolas", "10.0.0.1") for _ in range(10)))
+    assert await auth.failures("nicolas", "10.0.0.1") == 10
+
+
+async def test_console_keys_use_the_hybrid_backends_redis_prefixes(storage):
+    from ad_seller.storage.hybrid_backend import _is_redis_key
+
+    token, _ = await auth.create_session("nicolas", "operator", ttl_hours=1)
+    await auth.record_failure("nicolas", "10.0.0.1")
+    assert _is_redis_key(auth.SESSION_PREFIX + token)
+    for key in await storage.keys("rate_limit:console:*"):
+        assert _is_redis_key(key)
+
+
 def _app_with_operator_route(config: ConsoleConfig) -> FastAPI:
     """A sub-application mounted at /console, as the real console is, so root_path is set."""
     sub = FastAPI()
@@ -1235,8 +1253,11 @@ from .config import ConsoleConfig
 
 SESSION_COOKIE = "console_session"
 CSRF_COOKIE = "console_csrf"
-SESSION_PREFIX = "console_session:"
-RATE_PREFIX = "console_ratelimit:"
+# The hybrid backend routes "session:" and "rate_limit:" keys to Redis (ephemeral,
+# TTL-native) and everything else to Postgres. Using those prefixes puts console
+# sessions and login failures where they belong without touching the router.
+SESSION_PREFIX = "session:console:"
+RATE_PREFIX = "rate_limit:console:"
 RATE_LIMIT_MAX = 5
 RATE_LIMIT_WINDOW_SECONDS = 600
 
@@ -1303,27 +1324,34 @@ async def delete_session(token: str) -> None:
     await (await kv()).delete(SESSION_PREFIX + token)
 
 
-def _rate_keys(username: str, address: str) -> tuple[str, str]:
-    return f"{RATE_PREFIX}user:{username}", f"{RATE_PREFIX}addr:{address}"
+def _rate_scopes(username: str, address: str) -> tuple[str, str]:
+    return f"{RATE_PREFIX}user:{username}:", f"{RATE_PREFIX}addr:{address}:"
 
 
 async def failures(username: str, address: str) -> int:
+    """Failures in the window: one TTL key per failure, counted, never read-modify-written.
+
+    Every backend's ``set`` with a TTL and ``keys`` with a prefix pattern are atomic
+    on their own, so concurrent failures cannot lose each other and expiry is the
+    store's, not ours.
+    """
     storage = await kv()
-    counts = [await storage.get(key) or 0 for key in _rate_keys(username, address)]
-    return max(int(c) for c in counts)
+    counts = [len(await storage.keys(scope + "*")) for scope in _rate_scopes(username, address)]
+    return max(counts)
 
 
 async def record_failure(username: str, address: str) -> None:
     storage = await kv()
-    for key in _rate_keys(username, address):
-        current = int(await storage.get(key) or 0)
-        await storage.set(key, current + 1, ttl=RATE_LIMIT_WINDOW_SECONDS)
+    stamp = secrets.token_hex(8)
+    for scope in _rate_scopes(username, address):
+        await storage.set(scope + stamp, 1, ttl=RATE_LIMIT_WINDOW_SECONDS)
 
 
 async def clear_failures(username: str, address: str) -> None:
     storage = await kv()
-    for key in _rate_keys(username, address):
-        await storage.delete(key)
+    for scope in _rate_scopes(username, address):
+        for key in await storage.keys(scope + "*"):
+            await storage.delete(key)
 
 
 def safe_next(value: Optional[str], root_path: str) -> str:
@@ -1427,11 +1455,11 @@ Note on the 303: FastAPI's default `HTTPException` handler returns the status an
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_auth.py -q -p no:warnings
 ```
-Expected: `15 passed`.
+Expected: `17 passed`.
 
 - [ ] **Step 6: Revert check**
 
-In `safe_next`, replace the body with `return value or home` and rerun: `test_safe_next_only_allows_paths_under_the_mount` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore. Then in `current_operator`, delete the account reread block: the three `*_kills_an_issued_session` tests must fail. Restore.
+In `safe_next`, replace the body with `return value or home` and rerun: `test_safe_next_only_allows_paths_under_the_mount` must fail. Restore. Then in `current_operator`, drop the `is_htmx` branch: `test_no_cookie_tells_htmx_to_redirect` must fail. Restore. Then in `_sso_operator`, delete the `from_trusted_proxy` check: `test_sso_rejects_header_from_untrusted_address` must fail. Restore. Then in `current_operator`, delete the account reread block: the three `*_kills_an_issued_session` tests must fail. Restore. Then change `SESSION_PREFIX` back to `"console_session:"`: `test_console_keys_use_the_hybrid_backends_redis_prefixes` must fail. Restore.
 
 - [ ] **Step 7: Commit**
 
