@@ -1453,8 +1453,9 @@ async def test_me_returns_console_key_info(api_app, console_key):
     key, key_id = console_key
     api = _api(api_app, key)
     me = await api.me(user="nicolas")
-    assert me["key_id"] == key_id
-    assert me["role"] == "operator"
+    assert me.key_id == key_id
+    assert me.role == "operator"
+    assert me.is_active is True
 
 
 async def test_every_call_carries_key_and_user_header(api_app, console_key):
@@ -1476,15 +1477,16 @@ async def test_every_call_carries_key_and_user_header(api_app, console_key):
 async def test_health_merges_root_and_health(api_app, console_key):
     key, _ = console_key
     health = await _api(api_app, key).health(user="nicolas")
-    assert health["status"] == "healthy"
-    assert health["name"] == "Ad Seller System API"
-    assert health["version"]
+    assert health.status == "healthy"
+    assert health.name == "Ad Seller System API"
+    assert health.version
 
 
 async def test_inventory_sync_status_shape(api_app, console_key):
     key, _ = console_key
     status = await _api(api_app, key).inventory_sync_status(user="nicolas")
-    assert set(status) >= {"enabled", "last_sync", "sync_count"}
+    assert status.enabled is False
+    assert status.sync_count == 0
 
 
 async def test_last_event_is_none_when_bus_is_empty(api_app, console_key):
@@ -1514,6 +1516,57 @@ async def test_server_error_raises_unavailable(api_app, console_key):
         api_app.dependency_overrides.clear()
     assert exc.value.status == 500
     assert key not in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [404, 409, 429, 500, 502, 503])
+async def test_error_statuses_raise_unavailable_with_the_status(api_app, console_key, status):
+    from fastapi import HTTPException
+
+    key, _ = console_key
+
+    def fail():
+        raise HTTPException(status_code=status)
+
+    api_app.dependency_overrides[deps._require_api_key_record] = fail
+    try:
+        with pytest.raises(ApiUnavailable) as exc:
+            await _api(api_app, key).me(user="nicolas")
+    finally:
+        api_app.dependency_overrides.clear()
+    assert exc.value.status == status
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_auth_statuses_raise_rejected(api_app, console_key, status):
+    from fastapi import HTTPException
+
+    key, _ = console_key
+
+    def fail():
+        raise HTTPException(status_code=status)
+
+    api_app.dependency_overrides[deps._require_api_key_record] = fail
+    try:
+        with pytest.raises(ApiRejected) as exc:
+            await _api(api_app, key).me(user="nicolas")
+    finally:
+        api_app.dependency_overrides.clear()
+    assert exc.value.status == status
+
+
+@pytest.mark.parametrize("body", [[], None, "text", {"unexpected": 1}, {"events": None}, {"events": [{"no": "fields"}]}])
+async def test_every_method_rejects_malformed_bodies(api_app, console_key, body, monkeypatch):
+    key, _ = console_key
+    api = _api(api_app, key)
+
+    async def fake_get(path, user, params=None):
+        return body
+
+    monkeypatch.setattr(api, "_get", fake_get)
+    for method in (api.me, api.health, api.inventory_sync_status, api.last_event):
+        with pytest.raises(ApiUnavailable) as exc:
+            await method(user="nicolas")
+        assert "unexpected response shape" in str(exc.value)
 
 
 async def test_timeout_raises_unavailable(api_app, console_key):
@@ -1558,9 +1611,39 @@ The ASGI transport runs the app inline, so the per-call bound is enforced with
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
 import httpx
+from pydantic import BaseModel, ValidationError
+
+M = TypeVar("M", bound=BaseModel)
+
+
+class KeyInfo(BaseModel):
+    """The subset of ApiKeyInfo the console shows. Unknown fields are ignored."""
+
+    key_id: str
+    label: str
+    role: str
+    is_active: bool
+    expires_at: Optional[str] = None
+
+
+class Health(BaseModel):
+    status: str
+    name: str
+    version: str
+
+
+class SyncStatus(BaseModel):
+    enabled: bool
+    last_sync: Optional[str] = None
+    sync_count: int = 0
+
+
+class EventSummary(BaseModel):
+    event_type: str
+    timestamp: str
 
 
 class ApiRejected(Exception):
@@ -1621,26 +1704,35 @@ class ConsoleApi:
         except ValueError as exc:
             raise ApiUnavailable(response.status_code, "non-JSON body") from exc
 
-    async def me(self, user: str) -> dict[str, Any]:
-        return await self._get("/auth/api-keys/me", user)
+    @staticmethod
+    def _parse(model: type[M], body: Any) -> M:
+        """A body the console does not understand degrades one card, never the page."""
+        try:
+            return model.model_validate(body)
+        except (ValidationError, TypeError) as exc:
+            raise ApiUnavailable(200, f"unexpected response shape for {model.__name__}") from exc
 
-    async def health(self, user: str) -> dict[str, Any]:
+    async def me(self, user: str) -> KeyInfo:
+        return self._parse(KeyInfo, await self._get("/auth/api-keys/me", user))
+
+    async def health(self, user: str) -> Health:
         health, root = await asyncio.gather(self._get("/health", user), self._get("/", user))
-        return {
-            "status": health.get("status", "unknown"),
-            "name": root.get("name", ""),
-            "version": root.get("version", ""),
-        }
+        if not isinstance(health, dict) or not isinstance(root, dict):
+            raise ApiUnavailable(200, "unexpected response shape for Health")
+        return self._parse(Health, {**root, **health})
 
-    async def inventory_sync_status(self, user: str) -> dict[str, Any]:
-        return await self._get("/api/v1/inventory-sync/status", user)
+    async def inventory_sync_status(self, user: str) -> SyncStatus:
+        return self._parse(SyncStatus, await self._get("/api/v1/inventory-sync/status", user))
 
-    async def last_event(self, user: str) -> Optional[dict[str, Any]]:
+    async def last_event(self, user: str) -> Optional[EventSummary]:
         body = await self._get("/events", user, params={"limit": 50})
-        events = body.get("events") or []
+        events = body.get("events") if isinstance(body, dict) else None
+        if events is None or not isinstance(events, list):
+            raise ApiUnavailable(200, "unexpected response shape for events")
         if not events:
             return None
-        return max(events, key=lambda e: e.get("timestamp", ""))
+        parsed = [self._parse(EventSummary, e) for e in events]
+        return max(parsed, key=lambda e: e.timestamp)
 ```
 
 The in-process transport is built by `mount_console` as `httpx.ASGITransport(app=root_app, raise_app_exceptions=False)`: the flag turns an unhandled exception inside the API into a 500 response, which `_get` maps to `ApiUnavailable(500, ...)`; without it the exception would propagate into the console route instead.
@@ -1650,11 +1742,11 @@ The in-process transport is built by `mount_console` as `httpx.ASGITransport(app
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_client.py -q -p no:warnings
 ```
-Expected: `8 passed`.
+Expected: `22 passed`.
 
 - [ ] **Step 6: Revert check**
 
-Remove the `X-Console-User` header line and rerun: `test_every_call_carries_key_and_user_header` must fail. Restore.
+Remove the `X-Console-User` header line and rerun: `test_every_call_carries_key_and_user_header` must fail. Restore. Then make `_parse` return `body` unchanged: `test_every_method_rejects_malformed_bodies` must fail. Restore.
 
 - [ ] **Step 7: Commit**
 
@@ -2165,14 +2257,13 @@ Create `src/ad_seller/interfaces/console/routes.py`:
 from __future__ import annotations
 
 import asyncio
-import functools
 import hmac
 import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -2181,7 +2272,7 @@ from fastapi.templating import Jinja2Templates
 from . import auth
 from .accounts import check_credentials
 from .auth import ConsoleState, Operator, current_operator
-from .client import ApiRejected, ApiUnavailable
+from .client import ApiRejected, ApiUnavailable, EventSummary, Health, KeyInfo, SyncStatus
 
 logger = logging.getLogger(__name__)
 
@@ -2216,19 +2307,15 @@ def _render(request: Request, name: str, status_code: int = 200, **context: Any)
     return templates.TemplateResponse(request, name, context, status_code=status_code)
 
 
-def guarded(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    """Render the error page instead of leaking a traceback; log once with a request id."""
+async def unexpected_error(request: Request, exc: Exception) -> HTMLResponse:
+    """Registered on the sub-application for ``Exception``: every console route is covered.
 
-    @functools.wraps(handler)
-    async def wrapper(request: Request, *args: Any, **kwargs: Any) -> Any:
-        try:
-            return await handler(request, *args, **kwargs)
-        except Exception:  # noqa: BLE001 — the whole point is to catch everything
-            request_id = uuid.uuid4().hex[:8]
-            logger.exception("console request %s failed (request id %s)", request.url.path, request_id)
-            return _render(request, "error.html", status_code=500, request_id=request_id, operator=None, nav=[])
-
-    return wrapper
+    HTTPException keeps FastAPI's own handler (redirects, 401/403/404 stay what they are).
+    Logs once with a request id; the page shows the id and nothing else.
+    """
+    request_id = uuid.uuid4().hex[:8]
+    logger.exception("console request %s failed (request id %s)", request.url.path, request_id)
+    return _render(request, "error.html", status_code=500, request_id=request_id, operator=None, nav=[])
 
 
 def _login_page(request: Request, *, error: str | None, status_code: int, next_path: str) -> HTMLResponse:
@@ -2252,14 +2339,12 @@ def _password_login_enabled(request: Request) -> None:
 
 
 @router.get("/login", response_class=HTMLResponse)
-@guarded
 async def login_form(request: Request, next: str | None = None) -> Any:
     _password_login_enabled(request)
     return _login_page(request, error=None, status_code=200, next_path=auth.safe_next(next, auth.root(request)))
 
 
 @router.post("/login", response_class=HTMLResponse)
-@guarded
 async def login_submit(
     request: Request,
     username: str = Form(""),
@@ -2292,7 +2377,6 @@ async def login_submit(
 
 
 @router.post("/logout")
-@guarded
 async def logout(request: Request, csrf: str = Form("")) -> Any:
     _password_login_enabled(request)
     response = RedirectResponse(auth.login_path(request), status_code=303)
@@ -2331,7 +2415,7 @@ from fastapi.staticfiles import StaticFiles
 from .auth import ConsoleState
 from .client import ApiRejected, ApiUnavailable, ConsoleApi
 from .config import ConsoleConfig
-from .routes import router
+from .routes import router, unexpected_error
 
 logger = logging.getLogger(__name__)
 
@@ -2342,6 +2426,10 @@ def _build_sub_app() -> FastAPI:
     sub = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
     sub.include_router(router)
     sub.mount("/static", StaticFiles(directory=str(_STATIC)), name="console_static")
+    # Registered at build time, before any request, so it is part of the sub-app's
+    # middleware stack. Starlette re-raises after sending the page, which is why the
+    # test client is created with raise_app_exceptions=False and why uvicorn also logs it.
+    sub.add_exception_handler(Exception, unexpected_error)
     return sub
 
 
@@ -2722,6 +2810,23 @@ async def test_slow_route_degrades_its_card(client, console_app, account):
     assert els["card-agent"]["attrs"]["data-state"] == "ok"
 
 
+async def test_malformed_api_body_degrades_one_card(client, console_app, account, monkeypatch):
+    await login(client)
+    api = console_app.state.console_app.state.console.api
+    real_get = api._get
+
+    async def get(path, user, params=None):
+        return [] if path == "/health" else await real_get(path, user, params)
+
+    monkeypatch.setattr(api, "_get", get)
+    page = await client.get("/console/")
+    els = html_index(page.text)
+    assert page.status_code == 200
+    assert els["card-agent"]["attrs"]["data-state"] == "unavailable"
+    assert "unexpected response shape" in els["card-agent"]["text"]
+    assert els["card-access"]["attrs"]["data-state"] == "ok"
+
+
 async def test_unexpected_error_renders_error_page(client, console_app, account, caplog):
     await login(client)
 
@@ -2776,17 +2881,17 @@ async def _call(coro: Awaitable[Any]) -> Any:
         return exc
 
 
-def _agent_card(result: Any, checked: str) -> dict[str, str]:
+def _agent_card(result: Health | Exception, checked: str) -> dict[str, str]:
     if isinstance(result, Exception):
         return _degraded("agent", "Agent", result)
-    healthy = result["status"] == "healthy"
+    healthy = result.status == "healthy"
     return _card(
-        "agent", "Agent", "ok", "ok" if healthy else "error", "Healthy" if healthy else result["status"].title(),
-        f"{result['name']} {result['version']} · checked {checked}",
+        "agent", "Agent", "ok", "ok" if healthy else "error", "Healthy" if healthy else result.status.title(),
+        f"{result.name} {result.version} · checked {checked}",
     )
 
 
-def _access_card(result: Any, operator: Operator) -> dict[str, str]:
+def _access_card(result: KeyInfo | Exception, operator: Operator) -> dict[str, str]:
     if isinstance(result, Exception):
         return _degraded("access", "Console access", result)
     if operator.session_expires_at is not None:
@@ -2794,33 +2899,33 @@ def _access_card(result: Any, operator: Operator) -> dict[str, str]:
         session = f"session {max(int(left.total_seconds() // 3600), 0)} h left"
     else:
         session = "signed in through the identity proxy"
-    status = "active" if result.get("is_active") else "revoked or expired"
-    expiry = result.get("expires_at") or "never"
+    status = "active" if result.is_active else "revoked or expired"
+    expiry = result.expires_at or "never"
     return _card(
-        "access", "Console access", "ok", "ok" if result.get("is_active") else "error",
+        "access", "Console access", "ok", "ok" if result.is_active else "error",
         f"{operator.username} · {session}",
-        f"API calls use key {result.get('label')} ({result.get('key_id')}), {status}, expires: {expiry}",
+        f"API calls use key {result.label} ({result.key_id}), {status}, expires: {expiry}",
     )
 
 
-def _sync_card(result: Any) -> dict[str, str]:
+def _sync_card(result: SyncStatus | Exception) -> dict[str, str]:
     if isinstance(result, Exception):
         return _degraded("sync", "Inventory sync", result)
-    enabled = bool(result.get("enabled"))
-    last = result.get("last_sync") or "no sync yet"
+    last = result.last_sync or "no sync yet"
     return _card(
-        "sync", "Inventory sync", "ok", "ok" if enabled else "warn", "Enabled" if enabled else "Disabled",
-        f"last sync: {last} · runs: {result.get('sync_count', 0)}",
+        "sync", "Inventory sync", "ok", "ok" if result.enabled else "warn",
+        "Enabled" if result.enabled else "Disabled",
+        f"last sync: {last} · runs: {result.sync_count}",
     )
 
 
-def _events_card(result: Any) -> dict[str, str]:
+def _events_card(result: EventSummary | None | Exception) -> dict[str, str]:
     """Only what the API says: the console does not read the agent's settings."""
     if isinstance(result, Exception):
         return _degraded("events", "Event bus", result)
     if result is None:
         return _card("events", "Event bus", "ok", "warn", "No events yet", "the bus has published nothing this process can see")
-    return _card("events", "Event bus", "ok", "ok", "Last event", f"{result.get('event_type')} at {result.get('timestamp')}")
+    return _card("events", "Event bus", "ok", "ok", "Last event", f"{result.event_type} at {result.timestamp}")
 
 
 async def build_cards(state: ConsoleState, operator: Operator) -> tuple[list[dict[str, str]], str]:
@@ -2835,14 +2940,12 @@ async def build_cards(state: ConsoleState, operator: Operator) -> tuple[list[dic
 
 
 @router.get("/", response_class=HTMLResponse)
-@guarded
 async def home(request: Request, operator: Operator = Depends(current_operator)) -> Any:
     cards, checked = await build_cards(_state(request), operator)
     return _render(request, "home.html", operator=operator, nav=_nav("setup"), cards=cards, checked_at=checked)
 
 
 @router.get("/partials/health", response_class=HTMLResponse)
-@guarded
 async def health_partial(request: Request, operator: Operator = Depends(current_operator)) -> Any:
     cards, checked = await build_cards(_state(request), operator)
     return _render(request, "partials/health_cards.html", cards=cards, checked_at=checked)
@@ -2856,11 +2959,11 @@ async def health_partial(request: Request, operator: Operator = Depends(current_
 rm -f ad_seller.db data/audit_fallback.jsonl
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console -q -p no:warnings
 ```
-Expected: all console tests pass (`test_home.py`: 7 passed).
+Expected: all console tests pass (`test_home.py`: 8 passed).
 
 - [ ] **Step 5: Revert check**
 
-In `_call`, remove the `except` clause: `test_revoked_console_key_degrades_access_card_only` and `test_slow_route_degrades_its_card` must fail (they would render the error page instead of a degraded card). Restore.
+In `_call`, remove the `except` clause: `test_revoked_console_key_degrades_access_card_only`, `test_slow_route_degrades_its_card`, and `test_malformed_api_body_degrades_one_card` must fail (they would render the error page instead of a degraded card). Restore. Then remove the `add_exception_handler` line in `_build_sub_app`: `test_unexpected_error_renders_error_page` must fail. Restore.
 
 - [ ] **Step 6: Commit**
 

@@ -154,7 +154,7 @@ The wordmark is rendered as text. Whether the console ships the IAB logo image i
 
 `client.py` defines `ConsoleApi`, built once in `mount_console` with an httpx transport, a base URL, and the console key. Today the transport is `ASGITransport(app=app)`, so a call goes through the real REST router in-process: same dependencies, same handlers, same JSON, no socket. A network deployment passes an HTTP transport and the API's URL; only `mount_console` knows which. Every request carries `Authorization: Bearer <console key>` and `X-Console-User: <username>`.
 
-Foundation methods: `me()`, `health()` (health plus root, for the version), `inventory_sync_status()`, `last_event()`. Each returns the parsed JSON body as a dict, or raises `ApiUnavailable(status, detail)` for 5xx, timeouts, and non-JSON bodies, and `ApiRejected(status)` for 401 and 403. Nothing outside `client.py` imports httpx.
+Foundation methods: `me()`, `health()` (health plus root, for the version), `inventory_sync_status()`, `last_event()`. Each validates the JSON body into a console-owned model (`KeyInfo`, `Health`, `SyncStatus`, `EventSummary`; unknown fields ignored) and returns it, or raises `ApiUnavailable(status, detail)` for any non-2xx status other than 401 and 403, for timeouts, for non-JSON bodies, and for bodies that do not fit the model, and `ApiRejected(status)` for 401 and 403. A changed or malformed field therefore degrades one card and can never reach a template. Nothing outside `client.py` imports httpx.
 
 Client rules: never follow redirects; two-second timeout per call; no retries (the poll is the retry).
 
@@ -171,11 +171,11 @@ Page request flow:
 |---|---|
 | API 401 on the console key | Console access card shows "console key rejected" in the error color; other cards render; page is 200. Sessions are kept. |
 | API 403 on the console key | Same, with "console key is not an operator key". |
-| API 5xx, timeout, non-JSON | That card shows "unavailable", the status, and the time; the next poll retries. Never a stack trace. |
+| API 4xx other than 401/403, 5xx, timeout, non-JSON, or a body that does not fit the console's model | That card shows "unavailable", the status, and the reason; the next poll retries. Never a stack trace. |
 | Session missing or expired | Redirect to login with `next`; `HX-Redirect` for HTMX requests. |
 | Login failure | Generic message, fixed delay. Rate limit exceeded: 429 with the wait time. |
 | Console misconfigured at startup | The startup check logs one line and raises; the app does not start with the console enabled but unusable. Flag off: none of this runs. |
-| Unexpected exception in a console route | A router-level handler renders a plain error page with a request id and logs the traceback. Log lines never contain the console key, a session token, or a password; a test checks this. |
+| Unexpected exception in a console route | One exception handler registered on the console sub-application at build time renders a plain error page with a request id and logs the traceback; `HTTPException` keeps its normal handling. Log lines never contain the console key, a session token, or a password; a test checks this. |
 
 ## 8. Testing
 
