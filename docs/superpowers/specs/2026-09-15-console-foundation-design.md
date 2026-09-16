@@ -36,21 +36,24 @@ The Foundation is the smallest deliverable that lets a person log in from a brow
 
 ```
 src/ad_seller/interfaces/console/
-  __init__.py        mount_console(app) and nothing else public
-  routes.py          one APIRouter, every path under /console
-  auth.py            current_operator dependency, session store, account checks
-  client.py          ConsoleApi: in-process HTTP client to the REST API
+  __init__.py        mount_console(root_app, config), verify_console_key(root_app), the sub-application
+  config.py          ConsoleConfig, built from Settings or supplied by tests
+  accounts.py        password hashing, account records, credential check; the only module touching storage
+  auth.py            sessions, CSRF cookie, login rate limit, current_operator dependency
+  client.py          ConsoleApi: HTTP client to the REST API over an injected transport, typed responses
+  routes.py          login, logout, landing page, health partial, rendering, the exception handler
   templates/
     base.html        shell: top bar, sidebar, content block
     login.html
     home.html        landing page (Setup and health seed)
+    error.html       unexpected-error page with a request id
     partials/        HTMX fragments, e.g. health_cards.html
   static/
-    htmx.min.js      vendored, pinned version noted in the file header
+    htmx.min.js      vendored, pinned version and hash noted in the file header
     console.css
 ```
 
-`mount_console(app)` is called at the end of `src/ad_seller/interfaces/api/main.py`, guarded by `settings.console_enabled`. It registers the router and the static mount. With the flag off the app has no console routes, no static mount, and no console imports at request time.
+The console is a FastAPI sub-application mounted at `/console` by `mount_console(app)`, called at the end of `src/ad_seller/interfaces/api/main.py` through a small flag-gated function that tests can call on a fresh app. With the flag off the app has no console mount, no static files, and no console imports at request time.
 
 The CLI gains `ad-seller create-console-user`, next to the existing `create-operator-key` command, with `--username`, a password prompt, and `--disable` to disable an account.
 

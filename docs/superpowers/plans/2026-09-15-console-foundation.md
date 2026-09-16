@@ -53,7 +53,7 @@ New files:
 | `tests/unit/console/test_client.py` | `ConsoleApi` against the real API |
 | `tests/unit/console/test_login_routes.py` | login, logout, cookies, CSRF, rate limit |
 | `tests/unit/console/test_home.py` | landing page, partial, degraded cards |
-| `tests/unit/console/test_startup.py` | key verification at startup, mount guard |
+| `tests/unit/console/test_startup.py` | key verification at startup, mount guard, flag wiring, the real lifespan |
 | `tests/unit/console/test_import_rule.py` | the console never imports internals |
 | `tests/unit/test_api_key_me_route.py` | the new `me` route |
 | `docs/guides/console.md` | operator guide |
@@ -3412,7 +3412,7 @@ This closes pull request 4: title `docs: operator console guide`.
 
 ## Self-review against the spec
 
-- Spec §3 package layout: Tasks 4, 6, 7, 8, 9 create every listed file; `config.py` is an addition to the spec's list (the spec put config inside `auth.py`; a separate file keeps `auth.py` from importing settings).
+- Spec §3 package layout: Tasks 4, 6, 7, 8, 9 create every listed file.
 - Spec §3 import rule: Task 10 `test_import_rule.py`, allowlist-based and resolving relative imports, with the storage seam confined to `accounts.py` (`auth.py` reaches storage only through `accounts.kv`).
 - Spec §3 `me` route: Tasks 1 and 2.
 - Spec §4 accounts, login, sessions, `current_operator`, console key: Tasks 4, 5, 6, 9, 10. Rate limit, generic message, fixed delay, CSRF, cookie flags, rotation, logout: Task 9 tests.
