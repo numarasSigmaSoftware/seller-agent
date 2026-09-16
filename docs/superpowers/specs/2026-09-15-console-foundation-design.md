@@ -43,7 +43,7 @@ The console is a separate repository, `seller-console`, with its own `pyproject.
 seller-console/
   pyproject.toml           package seller_console; runtime deps: fastapi, uvicorn, jinja2, python-multipart, httpx, aiosqlite, pydantic-settings
   Dockerfile               python:3.12-slim + uv, non-root, HEALTHCHECK on /healthz
-  compose.console.yml      the console service, to be layered on the agent's compose stack
+  compose.yml              the console next to the pinned agent, Postgres, and Redis; the agent is built from git at AGENT_VERSION
   contract/
     openapi.json           the agent's OpenAPI document at the pinned agent version (vendored)
     AGENT_VERSION          the agent commit or tag the console is built and tested against
@@ -239,7 +239,7 @@ Environment variables of the console container:
 
 No signing secret is needed: session tokens are random and the CSRF check is a cookie-to-form comparison enforced by one dependency on every POST route.
 
-Deployment: one image, `seller-console`, built from the console repository. `compose.console.yml` adds a `console` service to the agent's stack: it depends on the agent's service being healthy, mounts a volume at `/data`, exposes port 8080, and reads the variables above from `.env`. Running the stack is `docker compose -f infra/docker/docker-compose.yml -f compose.console.yml up -d` from a checkout that has both files, and the console README shows it. Onboarding an operator is `docker compose exec console seller-console create-user --username <name>`. The agent's own compose file and image do not change.
+Deployment: one image, `seller-console`, built from the console repository. The repository's `compose.yml` is a complete stack: the agent built from its git repository at `AGENT_VERSION` (a test checks the two agree), Postgres, Redis, and the `console` service, which depends on the agent being healthy, mounts a volume at `/data`, exposes port 8080, and reads the variables above from `.env`. `docker compose up -d --build` runs it; onboarding an operator is `docker compose exec console seller-console create-user --username <name>`. To add the console to an existing agent stack instead, only the `console` service and its volume are copied into that stack's compose file. The agent's own compose file and image do not change.
 
 Documentation lives in the console repository: a README covering enabling, minting the console key on the agent (`ad-seller create-operator-key --label console`), creating a user, the SSO header, and bumping the agent version. The agent's repository receives only the documentation that belongs to its enabler routes.
 
