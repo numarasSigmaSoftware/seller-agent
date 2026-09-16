@@ -1750,19 +1750,21 @@ class ConsoleApi:
         operator_api_key: str,
         timeout: float = 2.0,
     ) -> None:
-        self._client = httpx.AsyncClient(transport=transport, base_url=base_url, follow_redirects=False)
+        # Nothing to own or close: a client is opened per call and closed with it.
+        # An in-process transport makes that free; a network transport gives up
+        # connection pooling, which four calls every thirty seconds does not need.
+        self._transport = transport
+        self._base_url = base_url
         self._key = operator_api_key
         self._timeout = timeout
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
 
     async def _get(self, path: str, user: str, params: Optional[dict] = None) -> Any:
         headers = {"Authorization": f"Bearer {self._key}", "X-Console-User": user}
         try:
-            response = await asyncio.wait_for(
-                self._client.get(path, headers=headers, params=params), self._timeout
-            )
+            async with httpx.AsyncClient(
+                transport=self._transport, base_url=self._base_url, follow_redirects=False
+            ) as client:
+                response = await asyncio.wait_for(client.get(path, headers=headers, params=params), self._timeout)
         except asyncio.TimeoutError as exc:
             raise ApiUnavailable(0, f"timeout after {self._timeout}s") from exc
         except httpx.HTTPError as exc:
@@ -2773,13 +2775,19 @@ Expected: the import-rule tests pass already (the package is clean); `test_start
 
 - [ ] **Step 3: Wire the flag and the startup check into the API app**
 
-In `src/ad_seller/interfaces/api/main.py`, inside `lifespan`, right after `start_sync_scheduler()`, add:
+In `src/ad_seller/interfaces/api/main.py`, inside `lifespan`, insert the console check **before** `start_sync_scheduler()`, so a bad key fails startup before anything that would need cleanup has started:
 
 ```python
     from ..console import verify_console_key
 
+    # Refuse to start with a console that cannot log anyone in. Runs first: nothing
+    # below has started yet, so a failure here leaves nothing to stop.
     await verify_console_key(application)
+
+    start_sync_scheduler()
 ```
+
+(`start_sync_scheduler()` is the existing line; it moves below the check.) The console holds no client or connection, so the lifespan's `finally` needs no console teardown.
 
 At the very end of `main.py`, after the `_mark_routes_changed` block, add:
 
@@ -3262,7 +3270,7 @@ This closes pull request 4: title `docs: operator console guide`.
 - Spec §4 accounts, login, sessions, `current_operator`, console key: Tasks 4, 5, 6, 9, 10. Rate limit, generic message, fixed delay, CSRF, cookie flags, rotation, logout: Task 9 tests.
 - Spec §5 pages and palette: Task 8 templates and CSS, Task 11 cards.
 - Spec §6 client: Task 7, including the two-second bound and no redirects.
-- Spec §7 error handling: Task 7 (client errors), Task 9 (`guarded`, redirects, 429), Task 10 (startup refusal), Task 11 (degraded cards, error page, logs without secrets).
+- Spec §7 error handling: Task 7 (client errors), Task 9 (redirects, 429, sub-app exception handler), Task 10 (startup refusal before the scheduler starts), Task 11 (degraded cards, error page, logs without secrets).
 - Spec §8 testing: real SQLite, real API, boundary-forced failures, HTML by id, security tests, structural tests, revert checks: every task.
 - Spec §9 configuration, deployment, documentation: Tasks 3, 13.
 - Spec §10 delivery: PR boundaries marked after Tasks 2, 10, 12, 13.
