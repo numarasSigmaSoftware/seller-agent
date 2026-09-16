@@ -272,6 +272,6 @@ The fork's `ui/dev` branch remains the integration branch for agent-side enabler
 
 Every real screen; roles beyond `operator`; per-user API keys; the proxy container; the backend attribution change; the event stream; the IAB logo image; a dark theme; a published agent image (the compose smoke builds the agent from the pinned checkout).
 
-## 13. Implementation plan impact
+## 13. Implementation plan
 
-The plan in `docs/superpowers/plans/2026-09-15-console-foundation.md` was written for the in-repository placement and needs a revision before execution. What changes: the package path and name; the store module replaces the agent's storage seam; `create_app` and its own lifespan replace `mount_console` and the agent's lifespan wiring; the settings move from the agent's `Settings` to the console's own; the transport is `AsyncHTTPTransport` in production and `ASGITransport` over the pinned agent package in tests; Task 0 becomes the console repository scaffold and CI; the agent-side `me` route task is unchanged; the compose and smoke tasks target the console's compose file. What stays: every test and behaviour from the review round.
+The plan in `docs/superpowers/plans/2026-09-15-console-foundation.md` is revised for this placement: fifteen tasks across the two repositories, with the agent-side `me` route unchanged and every behaviour and test from the review round carried over.
