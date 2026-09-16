@@ -84,7 +84,7 @@ Accounts are created, reset, and disabled only through the CLI on the host. Ther
 
 ### Login
 
-`GET /console/login` renders the form and sets a pre-login cookie with a random CSRF value. `POST /console/login` requires the form field to equal the cookie value, then:
+CSRF is one policy, not per-route checks: every page the console renders issues (or re-issues) an HTTP-only `console_csrf` cookie and embeds the same random value in its forms, in password and SSO mode alike; a single `require_csrf` dependency on every POST route compares the form field with the cookie in constant time and answers 400 otherwise, and a test asserts every POST route carries it. `POST /console/login` then:
 
 1. Rate limit check: at most five failures per username and per client address in ten minutes. Each failure is its own key with a ten-minute TTL under the `rate_limit:` prefix, and the count is the number of live keys, so concurrent failures are never lost to a read-modify-write and expiry belongs to the store. Exceeded gives 429 and a message with the wait time.
 2. Account lookup and hash comparison, always taking the same code path so timing does not reveal whether the username exists.
@@ -202,7 +202,7 @@ Settings (environment names in capitals):
 | `console_trusted_identity_header` | empty | when set, SSO mode: this header names the user, required on every request |
 | `console_trusted_proxy_cidrs` | empty | networks the header is trusted from; required in SSO mode |
 
-No signing secret is needed: session tokens are random and the CSRF check is a cookie-to-form comparison.
+No signing secret is needed: session tokens are random and the CSRF check is a cookie-to-form comparison enforced by one dependency on every POST route.
 
 Deployment does not change. Same image, same compose file; the two new variables appear commented out in the compose example. HTMX is vendored, so no build step and no CDN.
 

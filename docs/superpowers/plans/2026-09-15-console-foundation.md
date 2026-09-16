@@ -2275,6 +2275,42 @@ async def test_logout_deletes_session_and_clears_cookie(client, account, storage
     assert 'console_session=""' in response.headers["set-cookie"] or "Max-Age=0" in response.headers["set-cookie"]
 
 
+async def test_logout_without_csrf_is_400_and_keeps_the_session(client, account, storage):
+    await login(client)
+    token = client.cookies["console_session"]
+    response = await client.post("/console/logout", data={"csrf": "bogus"})
+    assert response.status_code == 400
+    assert await storage.get(auth.SESSION_PREFIX + token) is not None
+
+
+async def test_every_post_route_requires_csrf(console_app):
+    from fastapi.routing import APIRoute
+
+    from ad_seller.interfaces.console.routes import require_csrf
+
+    sub = console_app.state.console_app
+    posts = [r for r in sub.routes if isinstance(r, APIRoute) and "POST" in r.methods]
+    assert posts, "no POST routes found"
+    for route in posts:
+        assert any(d.dependency is require_csrf for d in route.dependencies), route.path
+
+
+async def test_pages_issue_the_csrf_cookie_in_sso_mode(api_app, console_key, storage):
+    from ad_seller.interfaces.console import accounts, mount_console
+    from ad_seller.interfaces.console.config import ConsoleConfig
+
+    key, _ = console_key
+    await accounts.create_account("nicolas@example.com", "correct horse battery")
+    mount_console(
+        api_app,
+        ConsoleConfig(operator_api_key=key, trusted_identity_header="X-Forwarded-Email", trusted_proxy_cidrs=["127.0.0.1/32"]),
+    )
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api_app), base_url="http://test")
+    page = await client.get("/console/", headers={"X-Forwarded-Email": "nicolas@example.com"})
+    assert page.status_code == 200
+    assert "console_csrf" in page.cookies
+
+
 async def test_login_rotates_token(client, account):
     await login(client)
     first = client.cookies["console_session"]
@@ -2373,10 +2409,27 @@ def _nav(active_slug: str) -> list[dict[str, Any]]:
 
 
 def _render(request: Request, name: str, status_code: int = 200, **context: Any) -> HTMLResponse:
+    """Every rendered page carries the CSRF token and (re)issues its cookie.
+
+    That is the whole issuance policy: any page a browser can load, in password
+    or SSO mode, can post a form, and ``require_csrf`` checks it.
+    """
+    token = request.cookies.get(auth.CSRF_COOKIE) or secrets.token_urlsafe(32)
     context.setdefault("root", auth.root(request))
-    context.setdefault("csrf", request.cookies.get(auth.CSRF_COOKIE, ""))
+    context.setdefault("csrf", token)
     context.setdefault("sso", _state(request).config.sso)
-    return templates.TemplateResponse(request, name, context, status_code=status_code)
+    response = templates.TemplateResponse(request, name, context, status_code=status_code)
+    response.set_cookie(
+        auth.CSRF_COOKIE, token, httponly=True, samesite="lax", secure=auth.is_secure(request), path=auth.root(request) or "/"
+    )
+    return response
+
+
+async def require_csrf(request: Request, csrf: str = Form("")) -> None:
+    """Dependency on every POST route: the form field must equal the cookie."""
+    cookie = request.cookies.get(auth.CSRF_COOKIE, "")
+    if not cookie or not hmac.compare_digest(cookie, csrf):
+        raise HTTPException(status_code=400, detail="CSRF token missing or stale; reload the page")
 
 
 async def unexpected_error(request: Request, exc: Exception) -> HTMLResponse:
@@ -2391,17 +2444,7 @@ async def unexpected_error(request: Request, exc: Exception) -> HTMLResponse:
 
 
 def _login_page(request: Request, *, error: str | None, status_code: int, next_path: str) -> HTMLResponse:
-    token = request.cookies.get(auth.CSRF_COOKIE) or secrets.token_urlsafe(32)
-    response = _render(request, "login.html", status_code=status_code, csrf=token, error=error, next=next_path)
-    response.set_cookie(
-        auth.CSRF_COOKIE, token, httponly=True, samesite="lax", secure=auth.is_secure(request), path=auth.root(request) or "/"
-    )
-    return response
-
-
-def _csrf_ok(request: Request, submitted: str) -> bool:
-    cookie = request.cookies.get(auth.CSRF_COOKIE, "")
-    return bool(cookie) and hmac.compare_digest(cookie, submitted)
+    return _render(request, "login.html", status_code=status_code, error=error, next=next_path)
 
 
 def _password_login_enabled(request: Request) -> None:
@@ -2416,19 +2459,16 @@ async def login_form(request: Request, next: str | None = None) -> Any:
     return _login_page(request, error=None, status_code=200, next_path=auth.safe_next(next, auth.root(request)))
 
 
-@router.post("/login", response_class=HTMLResponse)
+@router.post("/login", response_class=HTMLResponse, dependencies=[Depends(require_csrf)])
 async def login_submit(
     request: Request,
     username: str = Form(""),
     password: str = Form(""),
-    csrf: str = Form(""),
     next: str = Form(""),
 ) -> Any:
     _password_login_enabled(request)
     config = _state(request).config
     next_path = auth.safe_next(next, auth.root(request))
-    if not _csrf_ok(request, csrf):
-        return _login_page(request, error="The form expired. Try again.", status_code=400, next_path=next_path)
 
     address = auth.client_address(request)
     if await auth.failures(username, address) >= auth.RATE_LIMIT_MAX:
@@ -2448,12 +2488,10 @@ async def login_submit(
     return response
 
 
-@router.post("/logout")
-async def logout(request: Request, csrf: str = Form("")) -> Any:
+@router.post("/logout", dependencies=[Depends(require_csrf)])
+async def logout(request: Request) -> Any:
     _password_login_enabled(request)
     response = RedirectResponse(auth.login_path(request), status_code=303)
-    if not _csrf_ok(request, csrf):
-        return response
     token = request.cookies.get(auth.SESSION_COOKIE)
     if token:
         await auth.delete_session(token)
@@ -2559,11 +2597,11 @@ Because `current_operator` reads `request.app.state.console`, and inside a mount
 ```bash
 PYTHONPATH=src UV_PROJECT_ENVIRONMENT=../sellerdemo/.venv uv run --no-sync pytest tests/unit/console/test_login_routes.py tests/unit/console -q -p no:warnings
 ```
-Expected: all console tests pass (`test_login_routes.py`: 12 passed).
+Expected: all console tests pass (`test_login_routes.py`: 15 passed).
 
 - [ ] **Step 7: Revert checks**
 
-1. Remove the `_csrf_ok` check in `login_submit`: `test_missing_csrf_is_400` must fail. Restore.
+1. Remove `dependencies=[Depends(require_csrf)]` from `login_submit`: `test_missing_csrf_is_400` and `test_every_post_route_requires_csrf` must fail. Restore.
 2. Change `>= auth.RATE_LIMIT_MAX` to `> 100`: `test_sixth_failure_is_rate_limited` must fail. Restore.
 
 - [ ] **Step 8: Commit**
